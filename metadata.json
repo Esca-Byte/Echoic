@@ -1,0 +1,6 @@
+{
+  "name": "Echoic",
+  "description": "High-performance, zero-ad music streaming app with full-length playback, synchronized karaoke lyrics, 5-band studio equalizer, and smart sleep timer.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

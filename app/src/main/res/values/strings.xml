@@ -1,0 +1,25 @@
+<resources>
+    <string name="app_name">Echoic</string>
+    <string name="search_placeholder">Search songs, artists, or albums…</string>
+    <string name="clear_search">Clear search</string>
+    <string name="section_moods">Moods &amp; Activities</string>
+    <string name="section_top_charts">Top Charts &amp; Trending</string>
+    <string name="section_favorites">Liked Tracks</string>
+    <string name="section_recent_searches">Recent Searches</string>
+    <string name="tab_controls">Controls</string>
+    <string name="tab_queue">Up Next</string>
+    <string name="tab_lyrics">Synced Lyrics</string>
+    <string name="sleep_timer_title">Smart Sleep Timer</string>
+    <string name="equalizer_title">Studio EQ &amp; Speed</string>
+    <string name="play_pause_cd">Play or Pause</string>
+    <string name="next_track_cd">Skip to Next Track</string>
+    <string name="prev_track_cd">Previous Track</string>
+    <string name="shuffle_cd">Toggle Shuffle</string>
+    <string name="repeat_cd">Cycle Repeat Mode</string>
+    <string name="favorite_cd">Toggle Favorite</string>
+    <string name="add_to_queue_cd">Add to Queue</string>
+    <string name="widget_mini_description">Compact Echoic mini player with play, next, and favorite controls</string>
+    <string name="widget_artwork_cd">Album Artwork</string>
+    <string name="widget_empty_title">Echoic Music</string>
+    <string name="widget_empty_artist">Tap to start listening</string>
+</resources>
