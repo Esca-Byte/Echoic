@@ -96,6 +96,7 @@ import com.example.ui.theme.MutedSlate
 import com.example.ui.theme.NeonViolet
 import com.example.ui.theme.PitchBlack
 import com.example.ui.theme.SubtleBorder
+import com.example.ui.theme.ThemeOnPrimary
 
 private const val MIN_GENRES_REQUIRED = 3
 private const val MIN_ARTISTS_REQUIRED = 3
@@ -174,16 +175,20 @@ fun TasteOnboardingScreen(
     val requiredCount = if (currentStep == 1) MIN_GENRES_REQUIRED else MIN_ARTISTS_REQUIRED
     val isStepReady = selectedCount >= requiredCount
 
+    val bgMint = ElectricMint
+    val bgViolet = NeonViolet
+    val bgCanvas = PitchBlack
+
     Box(
         modifier = modifier
             .fillMaxSize()
-            .background(PitchBlack)
+            .background(bgCanvas)
             .drawWithCache {
                 val bgBrush = Brush.verticalGradient(
                     colors = listOf(
-                        ElectricMint.copy(alpha = 0.14f),
-                        NeonViolet.copy(alpha = 0.08f),
-                        PitchBlack
+                        bgMint.copy(alpha = 0.14f),
+                        bgViolet.copy(alpha = 0.08f),
+                        bgCanvas
                     ),
                     startY = 0f,
                     endY = 720f
@@ -467,7 +472,7 @@ fun TasteOnboardingScreen(
                         shape = RoundedCornerShape(50),
                         colors = ButtonDefaults.buttonColors(
                             containerColor = ElectricMint,
-                            contentColor = PitchBlack,
+                            contentColor = ThemeOnPrimary,
                             disabledContainerColor = CarbonElevated,
                             disabledContentColor = DimSlate
                         ),
@@ -818,7 +823,7 @@ private fun OnboardingArtistCard(
                     Icon(
                         imageVector = Icons.Filled.Check,
                         contentDescription = "Selected ${artist.name}",
-                        tint = PitchBlack,
+                        tint = ThemeOnPrimary,
                         modifier = Modifier.size(15.dp)
                     )
                 }

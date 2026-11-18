@@ -19,6 +19,7 @@ import com.example.data.local.MusicDatabase
 import com.example.data.local.PlaybackSessionStore
 import com.example.data.model.AlbumDetailData
 import com.example.data.model.AlbumReleaseItem
+import com.example.data.model.AppThemeState
 import com.example.data.model.ArtistProfileData
 import com.example.data.model.AudioOutputRoute
 import com.example.data.model.BatchDownloadProgress
@@ -38,6 +39,7 @@ import com.example.data.model.SearchArtistItem
 import com.example.data.model.SearchFilterType
 import com.example.data.model.SleepTimerState
 import com.example.data.model.SongItem
+import com.example.data.model.StudioThemePreset
 import com.example.data.model.TimeOfDayShelfData
 import com.example.data.model.defaultEqBands
 import com.example.data.repository.MusicRepository
@@ -293,6 +295,9 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
 
     private val _statusBannerMessage = MutableStateFlow<String?>(null)
     val statusBannerMessage: StateFlow<String?> = _statusBannerMessage.asStateFlow()
+
+    private val _themeState = MutableStateFlow(PlaybackSessionStore.loadThemeSettings(application))
+    val themeState: StateFlow<AppThemeState> = _themeState.asStateFlow()
 
     val moodCategories: List<MoodCategoryItem> = repository.getMoodCategories()
 
@@ -3158,6 +3163,24 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
 
     private fun showStatusMessage(message: String) {
         _statusBannerMessage.value = message
+    }
+
+    fun selectThemePreset(preset: StudioThemePreset) {
+        val updated = _themeState.value.copy(selectedTheme = preset)
+        _themeState.value = updated
+        PlaybackSessionStore.saveThemeSettings(getApplication(), updated)
+    }
+
+    fun setAmoledPureBlack(enabled: Boolean) {
+        val updated = _themeState.value.copy(amoledPureBlack = enabled)
+        _themeState.value = updated
+        PlaybackSessionStore.saveThemeSettings(getApplication(), updated)
+    }
+
+    fun setDynamicArtworkTint(enabled: Boolean) {
+        val updated = _themeState.value.copy(dynamicArtworkTint = enabled)
+        _themeState.value = updated
+        PlaybackSessionStore.saveThemeSettings(getApplication(), updated)
     }
 
     private fun sendServiceCustomCommand(action: String, args: Bundle = Bundle.EMPTY) {

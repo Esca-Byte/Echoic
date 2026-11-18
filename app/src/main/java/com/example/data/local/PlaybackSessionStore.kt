@@ -1,9 +1,11 @@
 package com.example.data.local
 
 import android.content.Context
+import com.example.data.model.AppThemeState
 import com.example.data.model.EqualizerState
 import com.example.data.model.PlayerRepeatMode
 import com.example.data.model.SongItem
+import com.example.data.model.StudioThemePreset
 import com.example.data.model.defaultEqBands
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
@@ -41,6 +43,9 @@ object PlaybackSessionStore {
 
     private const val AUDIO_PREFS = "echoic_audio_console_prefs"
     private const val KEY_AUDIO_SETTINGS_JSON = "persisted_audio_settings_json"
+
+    private const val THEME_PREFS = "echoic_theme_prefs"
+    private const val KEY_THEME_STATE_JSON = "persisted_theme_state_json"
 
     private val json = Json {
         ignoreUnknownKeys = true
@@ -149,5 +154,26 @@ object PlaybackSessionStore {
             wiredPreset = parsed.wiredPreset.ifBlank { "Studio Warmth" },
             bluetoothPreset = parsed.bluetoothPreset.ifBlank { "Bass Boost" }
         )
+    }
+
+    fun saveThemeSettings(context: Context, state: AppThemeState) {
+        runCatching {
+            val encoded = json.encodeToString(state)
+            context.applicationContext
+                .getSharedPreferences(THEME_PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .putString(KEY_THEME_STATE_JSON, encoded)
+                .apply()
+        }
+    }
+
+    fun loadThemeSettings(context: Context): AppThemeState {
+        val raw = context.applicationContext
+            .getSharedPreferences(THEME_PREFS, Context.MODE_PRIVATE)
+            .getString(KEY_THEME_STATE_JSON, null)
+            ?: return AppThemeState()
+        return runCatching {
+            json.decodeFromString<AppThemeState>(raw)
+        }.getOrDefault(AppThemeState())
     }
 }

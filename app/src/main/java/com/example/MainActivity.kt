@@ -12,8 +12,10 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.Coil
 import coil.ImageLoader
 import coil.disk.DiskCache
@@ -33,7 +35,8 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
 
         setContent {
-            SomifyTheme {
+            val themeState by playerViewModel.themeState.collectAsStateWithLifecycle()
+            SomifyTheme(themeState = themeState) {
                 // Request POST_NOTIFICATIONS permission on Android 13+ for lock-screen & notification media controls
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                     val notificationPermissionLauncher = rememberLauncherForActivityResult(

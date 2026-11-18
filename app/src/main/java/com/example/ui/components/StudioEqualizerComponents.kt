@@ -27,21 +27,26 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.KeyboardArrowRight
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.outlined.AutoAwesome
 import androidx.compose.material.icons.outlined.Bedtime
 import androidx.compose.material.icons.outlined.BluetoothAudio
 import androidx.compose.material.icons.outlined.GraphicEq
 import androidx.compose.material.icons.outlined.Headphones
+import androidx.compose.material.icons.outlined.Palette
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Speaker
 import androidx.compose.material.icons.outlined.Speed
 import androidx.compose.material.icons.outlined.Tune
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
@@ -75,10 +80,12 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.data.model.AppThemeState
 import com.example.data.model.AudioOutputRoute
 import com.example.data.model.EqualizerBand
 import com.example.data.model.EqualizerState
 import com.example.data.model.SleepTimerState
+import com.example.data.model.StudioThemePreset
 import com.example.ui.theme.AlabasterWhite
 import com.example.ui.theme.CarbonElevated
 import com.example.ui.theme.CarbonSurface
@@ -91,6 +98,8 @@ import com.example.ui.theme.NeonViolet
 import com.example.ui.theme.PitchBlack
 import com.example.ui.theme.SubtleBorder
 import com.example.ui.theme.SunsetCoral
+import com.example.ui.theme.ThemeOnPrimary
+import com.example.ui.theme.resolveStudioPalette
 import java.util.Locale
 import kotlin.math.PI
 import kotlin.math.abs
@@ -127,6 +136,10 @@ fun StudioEqualizerConsole(
     onSetAutoQueueRadio: (Boolean) -> Unit = {},
     onSetAutoDeviceProfilesEnabled: (Boolean) -> Unit = {},
     onSetOutputRoutePreset: (AudioOutputRoute, String) -> Unit = { _, _ -> },
+    themeState: AppThemeState = AppThemeState(),
+    onSelectThemePreset: (StudioThemePreset) -> Unit = {},
+    onSetAmoledPureBlack: (Boolean) -> Unit = {},
+    onSetDynamicArtworkTint: (Boolean) -> Unit = {},
     selectedTasteGenres: List<String> = emptyList(),
     onOpenTasteEditor: () -> Unit = {},
     modifier: Modifier = Modifier
@@ -169,6 +182,16 @@ fun StudioEqualizerConsole(
             contentPadding = PaddingValues(top = 12.dp, bottom = 32.dp),
             verticalArrangement = Arrangement.spacedBy(18.dp)
         ) {
+            // 0. Appearance & Premium Studio Themes Card
+            item(key = "studio_appearance_themes") {
+                AppearanceAndThemesCard(
+                    themeState = themeState,
+                    onSelectThemePreset = onSelectThemePreset,
+                    onSetAmoledPureBlack = onSetAmoledPureBlack,
+                    onSetDynamicArtworkTint = onSetDynamicArtworkTint
+                )
+            }
+
             // 1. Sleek Equalizer Header Card with Master Power Switch
             item(key = "studio_eq_header") {
                 Surface(
@@ -233,7 +256,7 @@ fun StudioEqualizerConsole(
                             checked = equalizerState.isEnabled,
                             onCheckedChange = onSetEqEnabled,
                             colors = SwitchDefaults.colors(
-                                checkedThumbColor = PitchBlack,
+                                checkedThumbColor = ThemeOnPrimary,
                                 checkedTrackColor = ElectricMint,
                                 uncheckedThumbColor = MutedSlate,
                                 uncheckedTrackColor = CarbonElevated,
@@ -527,7 +550,7 @@ fun StudioEqualizerConsole(
                             checked = equalizerState.gaplessPlayback,
                             onCheckedChange = onSetGaplessPlayback,
                             colors = SwitchDefaults.colors(
-                                checkedThumbColor = PitchBlack,
+                                checkedThumbColor = ThemeOnPrimary,
                                 checkedTrackColor = ElectricMint,
                                 uncheckedThumbColor = MutedSlate,
                                 uncheckedTrackColor = CarbonElevated,
@@ -602,7 +625,7 @@ fun StudioEqualizerConsole(
                             checked = equalizerState.autoDeviceProfilesEnabled,
                             onCheckedChange = onSetAutoDeviceProfilesEnabled,
                             colors = SwitchDefaults.colors(
-                                checkedThumbColor = PitchBlack,
+                                checkedThumbColor = ThemeOnPrimary,
                                 checkedTrackColor = ElectricMint,
                                 uncheckedThumbColor = MutedSlate,
                                 uncheckedTrackColor = CarbonElevated,
@@ -668,7 +691,7 @@ fun StudioEqualizerConsole(
                             }
 
                             Surface(
-                                color = if (isActiveRoute) ElectricMint.copy(alpha = 0.16f) else PitchBlack.copy(alpha = 0.55f),
+                                color = if (isActiveRoute) ElectricMint.copy(alpha = 0.16f) else CarbonElevated,
                                 shape = RoundedCornerShape(50),
                                 modifier = Modifier.border(
                                     width = 0.6.dp,
@@ -771,12 +794,12 @@ fun StudioEqualizerConsole(
                                     style = MaterialTheme.typography.labelMedium.copy(
                                         fontWeight = FontWeight.ExtraBold
                                     ),
-                                    color = PitchBlack
+                                    color = ThemeOnPrimary
                                 )
                                 Icon(
                                     imageVector = Icons.AutoMirrored.Outlined.KeyboardArrowRight,
                                     contentDescription = null,
-                                    tint = PitchBlack,
+                                    tint = ThemeOnPrimary,
                                     modifier = Modifier.size(16.dp)
                                 )
                             }
@@ -811,11 +834,19 @@ private fun StudioEqCurveGraph(
         state
     }
 
+    val curveBorder = SubtleBorder
+    val curvePrimary = ElectricMint
+    val curveCyan = CyberCyan
+    val curveViolet = NeonViolet
+    val curveMuted = MutedSlate
+    val curveDim = DimSlate
+    val curveText = AlabasterWhite
+
     Box(
         modifier = modifier
             .clip(RoundedCornerShape(16.dp))
             .background(PitchBlack.copy(alpha = 0.78f))
-            .border(0.75.dp, SubtleBorder.copy(alpha = 0.65f), RoundedCornerShape(16.dp))
+            .border(0.75.dp, curveBorder.copy(alpha = 0.65f), RoundedCornerShape(16.dp))
             .padding(horizontal = 10.dp, vertical = 10.dp)
     ) {
         Canvas(modifier = Modifier.fillMaxSize()) {
@@ -831,7 +862,7 @@ private fun StudioEqCurveGraph(
                 val y = h * ratio
                 val isZeroLine = idx == 2
                 drawLine(
-                    color = if (isZeroLine) SubtleBorder.copy(alpha = 0.9f) else SubtleBorder.copy(alpha = 0.38f),
+                    color = if (isZeroLine) curveBorder.copy(alpha = 0.9f) else curveBorder.copy(alpha = 0.38f),
                     start = Offset(0f, y),
                     end = Offset(w, y),
                     strokeWidth = if (isZeroLine) 1.2.dp.toPx() else 0.75.dp.toPx(),
@@ -891,22 +922,22 @@ private fun StudioEqCurveGraph(
 
             val primaryStrokeBrush = Brush.horizontalGradient(
                 colors = if (isEnabled) {
-                    listOf(ElectricMint, CyberCyan, NeonViolet)
+                    listOf(curvePrimary, curveCyan, curveViolet)
                 } else {
-                    listOf(MutedSlate.copy(alpha = 0.5f), DimSlate.copy(alpha = 0.5f))
+                    listOf(curveMuted.copy(alpha = 0.5f), curveDim.copy(alpha = 0.5f))
                 }
             )
 
             val areaFillBrush = Brush.verticalGradient(
                 colors = if (isEnabled) {
                     listOf(
-                        ElectricMint.copy(alpha = 0.28f),
-                        CyberCyan.copy(alpha = 0.10f),
+                        curvePrimary.copy(alpha = 0.28f),
+                        curveCyan.copy(alpha = 0.10f),
                         Color.Transparent
                     )
                 } else {
                     listOf(
-                        MutedSlate.copy(alpha = 0.10f),
+                        curveMuted.copy(alpha = 0.10f),
                         Color.Transparent
                     )
                 }
@@ -924,20 +955,20 @@ private fun StudioEqCurveGraph(
             points.forEach { pt ->
                 // Vertical guide line to node
                 drawLine(
-                    color = SubtleBorder.copy(alpha = 0.45f),
+                    color = curveBorder.copy(alpha = 0.45f),
                     start = Offset(pt.x, 0f),
                     end = Offset(pt.x, h),
                     strokeWidth = 0.75.dp.toPx()
                 )
                 if (isEnabled) {
                     drawCircle(
-                        color = ElectricMint.copy(alpha = 0.26f),
+                        color = curvePrimary.copy(alpha = 0.26f),
                         radius = 7.dp.toPx(),
                         center = pt
                     )
                 }
                 drawCircle(
-                    color = if (isEnabled) AlabasterWhite else MutedSlate,
+                    color = if (isEnabled) curveText else curveMuted,
                     radius = 3.5.dp.toPx(),
                     center = pt
                 )
@@ -1072,6 +1103,14 @@ private fun StudioVerticalFaderChannel(
                 }
                 .testTag("studio_vertical_fader_${band.index}")
         ) {
+            val faderTextPrimary = AlabasterWhite
+            val faderBorder = SubtleBorder
+            val faderElevated = CarbonElevated
+            val faderPrimary = ElectricMint
+            val faderCyan = CyberCyan
+            val faderViolet = NeonViolet
+            val faderMuted = MutedSlate
+
             Canvas(modifier = Modifier.fillMaxSize()) {
                 val pad = 16.dp.toPx()
                 val usableH = (size.height - pad * 2f).coerceAtLeast(1f)
@@ -1085,8 +1124,8 @@ private fun StudioVerticalFaderChannel(
                     val ty = pad + usableH * (t.toFloat() / tickSteps.toFloat())
                     val isCenter = t == tickSteps / 2
                     val tickLen = if (isCenter) 7.dp.toPx() else 4.dp.toPx()
-                    val tickColor = if (isCenter) AlabasterWhite.copy(alpha = 0.55f)
-                    else SubtleBorder.copy(alpha = 0.65f)
+                    val tickColor = if (isCenter) faderTextPrimary.copy(alpha = 0.55f)
+                    else faderBorder.copy(alpha = 0.65f)
 
                     drawLine(
                         color = tickColor,
@@ -1105,7 +1144,7 @@ private fun StudioVerticalFaderChannel(
                 // Center Track Groove
                 val grooveWidth = 6.dp.toPx()
                 drawRoundRect(
-                    color = CarbonElevated,
+                    color = faderElevated,
                     topLeft = Offset(centerX - grooveWidth / 2f, pad),
                     size = Size(grooveWidth, usableH),
                     cornerRadius = CornerRadius(grooveWidth / 2f, grooveWidth / 2f)
@@ -1116,9 +1155,9 @@ private fun StudioVerticalFaderChannel(
                     val topY = minOf(centerY, thumbY)
                     val barH = abs(thumbY - centerY)
                     val activeBrush = if (thumbY <= centerY) {
-                        Brush.verticalGradient(listOf(ElectricMint, CyberCyan))
+                        Brush.verticalGradient(listOf(faderPrimary, faderCyan))
                     } else {
-                        Brush.verticalGradient(listOf(CyberCyan, NeonViolet))
+                        Brush.verticalGradient(listOf(faderCyan, faderViolet))
                     }
                     drawRoundRect(
                         brush = activeBrush,
@@ -1134,13 +1173,13 @@ private fun StudioVerticalFaderChannel(
                 val capTopLeft = Offset(centerX - capWidth / 2f, thumbY - capHeight / 2f)
 
                 drawRoundRect(
-                    color = CarbonElevated,
+                    color = faderElevated,
                     topLeft = capTopLeft,
                     size = Size(capWidth, capHeight),
                     cornerRadius = CornerRadius(5.dp.toPx(), 5.dp.toPx())
                 )
                 drawRoundRect(
-                    color = if (isEnabled) ElectricMint else SubtleBorder,
+                    color = if (isEnabled) faderPrimary else faderBorder,
                     topLeft = capTopLeft,
                     size = Size(capWidth, capHeight),
                     cornerRadius = CornerRadius(5.dp.toPx(), 5.dp.toPx()),
@@ -1148,7 +1187,7 @@ private fun StudioVerticalFaderChannel(
                 )
                 // Center indicator slit on fader cap
                 drawLine(
-                    color = if (isEnabled) ElectricMint else MutedSlate,
+                    color = if (isEnabled) faderPrimary else faderMuted,
                     start = Offset(centerX - 7.dp.toPx(), thumbY),
                     end = Offset(centerX + 7.dp.toPx(), thumbY),
                     strokeWidth = 1.5.dp.toPx(),
@@ -1167,5 +1206,350 @@ private fun StudioVerticalFaderChannel(
             color = if (isEnabled) AlabasterWhite else MutedSlate,
             maxLines = 1
         )
+    }
+}
+
+@Composable
+private fun AppearanceAndThemesCard(
+    themeState: AppThemeState,
+    onSelectThemePreset: (StudioThemePreset) -> Unit,
+    onSetAmoledPureBlack: (Boolean) -> Unit,
+    onSetDynamicArtworkTint: (Boolean) -> Unit
+) {
+    Surface(
+        color = CarbonSurface,
+        shape = RoundedCornerShape(22.dp),
+        border = BorderStroke(0.75.dp, SubtleBorder.copy(alpha = 0.75f)),
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("appearance_themes_card")
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            // Card Header
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(40.dp)
+                            .clip(CircleShape)
+                            .background(ElectricMint.copy(alpha = 0.16f))
+                            .border(0.75.dp, ElectricMint.copy(alpha = 0.55f), CircleShape),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.Palette,
+                            contentDescription = null,
+                            tint = ElectricMint,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text(
+                            text = "Appearance & Themes",
+                            style = MaterialTheme.typography.titleMedium.copy(
+                                fontWeight = FontWeight.Bold
+                            ),
+                            color = AlabasterWhite
+                        )
+                        Text(
+                            text = "Studio atmosphere & surface palette",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MutedSlate
+                        )
+                    }
+                }
+
+                Surface(
+                    color = ElectricMint.copy(alpha = 0.14f),
+                    shape = RoundedCornerShape(50),
+                    border = BorderStroke(0.6.dp, ElectricMint.copy(alpha = 0.45f))
+                ) {
+                    Text(
+                        text = themeState.selectedTheme.displayName.uppercase(),
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            fontFamily = JetBrainsMonoFontFamily,
+                            fontWeight = FontWeight.Bold,
+                            letterSpacing = 0.6.sp
+                        ),
+                        color = ElectricMint,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                    )
+                }
+            }
+
+            // Interactive Horizontal Theme Preview Cards Carousel
+            LazyRow(
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                contentPadding = PaddingValues(end = 4.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("theme_carousel")
+            ) {
+                items(
+                    items = StudioThemePreset.entries,
+                    key = { it.name }
+                ) { preset ->
+                    StudioThemePreviewCard(
+                        preset = preset,
+                        isSelected = themeState.selectedTheme == preset,
+                        amoledPureBlack = themeState.amoledPureBlack,
+                        onClick = { onSelectThemePreset(preset) }
+                    )
+                }
+            }
+
+            HorizontalDivider(
+                thickness = 0.6.dp,
+                color = SubtleBorder.copy(alpha = 0.65f)
+            )
+
+            // True OLED Pure Black Switch (for dark themes)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(end = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(2.dp)
+                ) {
+                    Text(
+                        text = "True OLED Pure Black",
+                        style = MaterialTheme.typography.titleSmall.copy(
+                            fontWeight = FontWeight.SemiBold
+                        ),
+                        color = if (themeState.selectedTheme.isLight) MutedSlate else AlabasterWhite
+                    )
+                    Text(
+                        text = if (themeState.selectedTheme.isLight) {
+                            "Unavailable while Paper Daylight is active"
+                        } else {
+                            "Drops base canvas to #000000 for AMOLED depth & battery"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MutedSlate
+                    )
+                }
+                Switch(
+                    checked = themeState.amoledPureBlack && !themeState.selectedTheme.isLight,
+                    onCheckedChange = onSetAmoledPureBlack,
+                    enabled = !themeState.selectedTheme.isLight,
+                    colors = SwitchDefaults.colors(
+                        checkedThumbColor = ThemeOnPrimary,
+                        checkedTrackColor = ElectricMint,
+                        uncheckedThumbColor = MutedSlate,
+                        uncheckedTrackColor = CarbonElevated,
+                        uncheckedBorderColor = SubtleBorder
+                    ),
+                    modifier = Modifier.testTag("theme_amoled_switch")
+                )
+            }
+
+            // Dynamic Artwork Tint Switch
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(end = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(2.dp)
+                ) {
+                    Text(
+                        text = "Dynamic Artwork Tint",
+                        style = MaterialTheme.typography.titleSmall.copy(
+                            fontWeight = FontWeight.SemiBold
+                        ),
+                        color = AlabasterWhite
+                    )
+                    Text(
+                        text = "Blend cover-art glow into the player & screen backdrops",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MutedSlate
+                    )
+                }
+                Switch(
+                    checked = themeState.dynamicArtworkTint,
+                    onCheckedChange = onSetDynamicArtworkTint,
+                    colors = SwitchDefaults.colors(
+                        checkedThumbColor = ThemeOnPrimary,
+                        checkedTrackColor = ElectricMint,
+                        uncheckedThumbColor = MutedSlate,
+                        uncheckedTrackColor = CarbonElevated,
+                        uncheckedBorderColor = SubtleBorder
+                    ),
+                    modifier = Modifier.testTag("theme_dynamic_artwork_switch")
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun StudioThemePreviewCard(
+    preset: StudioThemePreset,
+    isSelected: Boolean,
+    amoledPureBlack: Boolean,
+    onClick: () -> Unit
+) {
+    val previewPalette = remember(preset, amoledPureBlack) {
+        resolveStudioPalette(
+            preset = preset,
+            amoledPureBlack = amoledPureBlack,
+            dynamicArtworkTint = false
+        )
+    }
+
+    Column(
+        modifier = Modifier
+            .width(136.dp)
+            .clip(RoundedCornerShape(18.dp))
+            .background(previewPalette.background)
+            .border(
+                width = if (isSelected) 1.75.dp else 0.75.dp,
+                color = if (isSelected) previewPalette.primary else previewPalette.subtleBorder,
+                shape = RoundedCornerShape(18.dp)
+            )
+            .clickable(onClick = onClick)
+            .padding(10.dp)
+            .testTag("theme_preview_card_${preset.name.lowercase()}"),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        // Miniature UI Preview Window
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(54.dp)
+                .clip(RoundedCornerShape(12.dp))
+                .background(
+                    Brush.linearGradient(
+                        colors = listOf(
+                            previewPalette.surface,
+                            previewPalette.surfaceElevated
+                        )
+                    )
+                )
+                .border(0.6.dp, previewPalette.subtleBorder, RoundedCornerShape(12.dp))
+                .padding(8.dp)
+        ) {
+            Column(
+                modifier = Modifier.fillMaxSize(),
+                verticalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    // Palette Swatch Dots
+                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Box(
+                            modifier = Modifier
+                                .size(8.dp)
+                                .clip(CircleShape)
+                                .background(previewPalette.primary)
+                        )
+                        Box(
+                            modifier = Modifier
+                                .size(8.dp)
+                                .clip(CircleShape)
+                                .background(previewPalette.tertiary)
+                        )
+                        Box(
+                            modifier = Modifier
+                                .size(8.dp)
+                                .clip(CircleShape)
+                                .background(previewPalette.secondary)
+                        )
+                    }
+
+                    if (isSelected) {
+                        Box(
+                            modifier = Modifier
+                                .size(16.dp)
+                                .clip(CircleShape)
+                                .background(previewPalette.primary),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Check,
+                                contentDescription = "Selected theme",
+                                tint = previewPalette.onPrimary,
+                                modifier = Modifier.size(11.dp)
+                            )
+                        }
+                    }
+                }
+
+                // Miniature Studio Waveform Bars + Mock Mini Bar
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.Bottom
+                ) {
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(2.5.dp),
+                        verticalAlignment = Alignment.Bottom
+                    ) {
+                        val barHeights = listOf(7.dp, 14.dp, 10.dp, 16.dp, 9.dp)
+                        barHeights.forEachIndexed { idx, h ->
+                            Box(
+                                modifier = Modifier
+                                    .width(3.dp)
+                                    .height(h)
+                                    .clip(RoundedCornerShape(2.dp))
+                                    .background(if (idx % 2 == 0) previewPalette.primary else previewPalette.tertiary)
+                            )
+                        }
+                    }
+
+                    Box(
+                        modifier = Modifier
+                            .width(42.dp)
+                            .height(6.dp)
+                            .clip(RoundedCornerShape(3.dp))
+                            .background(previewPalette.textPrimary.copy(alpha = 0.22f))
+                    )
+                }
+            }
+        }
+
+        Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
+            Text(
+                text = preset.displayName,
+                style = MaterialTheme.typography.labelMedium.copy(
+                    fontWeight = FontWeight.Bold
+                ),
+                color = previewPalette.textPrimary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = preset.vibeSubtitle,
+                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                color = previewPalette.textSecondary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
     }
 }

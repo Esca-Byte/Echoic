@@ -145,6 +145,7 @@ import androidx.compose.material.icons.outlined.Sort
 import androidx.compose.material.icons.outlined.Verified
 import com.example.data.model.AlbumDetailData
 import com.example.data.model.AlbumReleaseItem
+import com.example.data.model.AppThemeState
 import com.example.data.model.ArtistProfileData
 import com.example.data.model.AudioOutputRoute
 import com.example.data.model.BatchDownloadProgress
@@ -162,6 +163,7 @@ import com.example.data.model.SearchArtistItem
 import com.example.data.model.SearchFilterType
 import com.example.data.model.SleepTimerState
 import com.example.data.model.SongItem
+import com.example.data.model.StudioThemePreset
 import com.example.data.model.TimeOfDayShelfData
 import com.example.data.model.TrackSortOrder
 import com.example.ui.components.AnimatedFavoriteButton
@@ -188,9 +190,13 @@ import com.example.ui.theme.MidnightGradientEnd
 import com.example.ui.theme.MidnightGradientStart
 import com.example.ui.theme.MutedSlate
 import com.example.ui.theme.NeonViolet
+import com.example.ui.theme.PhotoForegroundColor
+import com.example.ui.theme.PhotoMutedColor
+import com.example.ui.theme.PhotoScrimColor
 import com.example.ui.theme.PitchBlack
 import com.example.ui.theme.SubtleBorder
 import com.example.ui.theme.SunsetCoral
+import com.example.ui.theme.ThemeOnPrimary
 import com.example.ui.theme.WorkoutGradientEnd
 import com.example.ui.theme.WorkoutGradientStart
 import com.example.ui.viewmodel.PlayerViewModel
@@ -211,6 +217,7 @@ fun HomeScreen(
     val playbackSpeed by viewModel.playbackSpeed.collectAsStateWithLifecycle()
     val playbackPitch by viewModel.playbackPitch.collectAsStateWithLifecycle()
     val equalizerState by viewModel.equalizerState.collectAsStateWithLifecycle()
+    val themeState by viewModel.themeState.collectAsStateWithLifecycle()
 
     val homeDiscoveryData by viewModel.homeDiscoveryData.collectAsStateWithLifecycle()
     val homeFeedSongs by viewModel.homeFeedSongs.collectAsStateWithLifecycle()
@@ -507,6 +514,7 @@ fun HomeScreen(
                     BottomNavTab.SETTINGS -> {
                         SettingsAndEqTabContent(
                             equalizerState = equalizerState,
+                            themeState = themeState,
                             playbackSpeed = playbackSpeed,
                             playbackPitch = playbackPitch,
                             sleepTimerState = sleepTimerState,
@@ -523,6 +531,9 @@ fun HomeScreen(
                             onSetAutoQueueRadio = viewModel::setAutoQueueRadio,
                             onSetAutoDeviceProfilesEnabled = viewModel::setAutoDeviceProfilesEnabled,
                             onSetOutputRoutePreset = viewModel::setOutputRoutePreset,
+                            onSelectThemePreset = viewModel::selectThemePreset,
+                            onSetAmoledPureBlack = viewModel::setAmoledPureBlack,
+                            onSetDynamicArtworkTint = viewModel::setDynamicArtworkTint,
                             onStartSleepTimer = viewModel::startSleepTimer,
                             onCancelSleepTimer = viewModel::cancelSleepTimer,
                             onOpenTasteEditor = viewModel::openTasteEditor
@@ -1070,15 +1081,19 @@ private fun RichHomeTabContent(
         }
     }
 
+    val homeTintPrimary = ElectricMint
+    val homeTintSecondary = NeonViolet
+    val homeBgColor = PitchBlack
+
     Box(
         modifier = Modifier
             .fillMaxSize()
             .drawWithCache {
                 val bgBrush = Brush.verticalGradient(
                     colors = listOf(
-                        ElectricMint.copy(alpha = 0.08f),
-                        NeonViolet.copy(alpha = 0.04f),
-                        PitchBlack
+                        homeTintPrimary.copy(alpha = 0.08f),
+                        homeTintSecondary.copy(alpha = 0.04f),
+                        homeBgColor
                     ),
                     startY = 0f,
                     endY = 580f
@@ -1707,16 +1722,18 @@ private fun PlaylistDetailScreen(
         }
     }
 
+    val playlistBgColor = PitchBlack
+
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(PitchBlack)
+            .background(playlistBgColor)
             .drawWithCache {
                 val bgBrush = Brush.verticalGradient(
                     colors = listOf(
                         ambientPrimary.copy(alpha = 0.22f),
                         ambientSecondary.copy(alpha = 0.10f),
-                        PitchBlack
+                        playlistBgColor
                     ),
                     startY = 0f,
                     endY = 780f
@@ -1877,7 +1894,7 @@ private fun PlaylistDetailScreen(
                             shape = RoundedCornerShape(50),
                             colors = ButtonDefaults.buttonColors(
                                 containerColor = ElectricMint,
-                                contentColor = PitchBlack
+                                contentColor = ThemeOnPrimary
                             ),
                             contentPadding = PaddingValues(horizontal = 26.dp, vertical = 12.dp),
                             modifier = Modifier.testTag("playlist_play_all_button")
@@ -2256,7 +2273,7 @@ private fun RenamePlaylistDialog(
                 enabled = title.isNotBlank(),
                 colors = ButtonDefaults.buttonColors(
                     containerColor = ElectricMint,
-                    contentColor = PitchBlack
+                    contentColor = ThemeOnPrimary
                 ),
                 modifier = Modifier.testTag("rename_playlist_confirm_button")
             ) {
@@ -2386,16 +2403,18 @@ private fun ArtistHubScreen(
     val (ambientPrimary, ambientSecondary) = rememberDynamicArtworkGlow(artistProfile.artworkUrl)
     val artistListState = rememberLazyListState()
 
+    val artistBgColor = PitchBlack
+
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(PitchBlack)
+            .background(artistBgColor)
             .drawWithCache {
                 val bgBrush = Brush.verticalGradient(
                     colors = listOf(
                         ambientPrimary.copy(alpha = 0.28f),
                         ambientSecondary.copy(alpha = 0.14f),
-                        PitchBlack
+                        artistBgColor
                     ),
                     startY = 0f,
                     endY = 820f
@@ -2576,7 +2595,7 @@ private fun ArtistHubScreen(
                             shape = RoundedCornerShape(50),
                             colors = ButtonDefaults.buttonColors(
                                 containerColor = ElectricMint,
-                                contentColor = PitchBlack
+                                contentColor = ThemeOnPrimary
                             ),
                             contentPadding = PaddingValues(horizontal = 22.dp, vertical = 11.dp),
                             modifier = Modifier.testTag("artist_hub_play_all_button")
@@ -2694,7 +2713,7 @@ private fun ArtistHubScreen(
                                         }
 
                                         Surface(
-                                            color = PitchBlack.copy(alpha = 0.78f),
+                                            color = PhotoScrimColor.copy(alpha = 0.78f),
                                             shape = RoundedCornerShape(50),
                                             modifier = Modifier
                                                 .align(Alignment.BottomStart)
@@ -2927,16 +2946,18 @@ private fun AlbumDetailScreen(
         it.isActive && it.collectionTitle.equals(albumDetail.title, ignoreCase = true)
     }
 
+    val albumBgColor = PitchBlack
+
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(PitchBlack)
+            .background(albumBgColor)
             .drawWithCache {
                 val bgBrush = Brush.verticalGradient(
                     colors = listOf(
                         ambientPrimary.copy(alpha = 0.26f),
                         ambientSecondary.copy(alpha = 0.12f),
-                        PitchBlack
+                        albumBgColor
                     ),
                     startY = 0f,
                     endY = 820f
@@ -3100,7 +3121,7 @@ private fun AlbumDetailScreen(
                             shape = RoundedCornerShape(50),
                             colors = ButtonDefaults.buttonColors(
                                 containerColor = ElectricMint,
-                                contentColor = PitchBlack
+                                contentColor = ThemeOnPrimary
                             ),
                             contentPadding = PaddingValues(horizontal = 24.dp, vertical = 12.dp),
                             modifier = Modifier.testTag("album_play_all_button")
@@ -3471,7 +3492,7 @@ private fun RecentlyPlayedQuickTile(
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
-                        .background(PitchBlack.copy(alpha = 0.65f)),
+                        .background(PhotoScrimColor.copy(alpha = 0.65f)),
                     contentAlignment = Alignment.Center
                 ) {
                     CircularProgressIndicator(
@@ -3484,7 +3505,7 @@ private fun RecentlyPlayedQuickTile(
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
-                        .background(PitchBlack.copy(alpha = 0.55f)),
+                        .background(PhotoScrimColor.copy(alpha = 0.55f)),
                     contentAlignment = Alignment.Center
                 ) {
                     MiniWaveformIndicator(isPlaying = isPlaying)
@@ -3636,6 +3657,7 @@ private fun SpotlightPlaylistHeroCard(
             .clickable(onClick = onOpenPlaylist)
             .testTag("spotlight_hero_card")
     ) {
+        val spotlightScrim = PhotoScrimColor
         OptimizedArtworkImage(
             artworkUrl = playlist.artworkUrl,
             contentDescription = playlist.title,
@@ -3645,15 +3667,15 @@ private fun SpotlightPlaylistHeroCard(
                 .drawWithCache {
                     val horizScrim = Brush.horizontalGradient(
                         colors = listOf(
-                            PitchBlack.copy(alpha = 0.94f),
-                            PitchBlack.copy(alpha = 0.78f),
-                            PitchBlack.copy(alpha = 0.35f)
+                            spotlightScrim.copy(alpha = 0.94f),
+                            spotlightScrim.copy(alpha = 0.78f),
+                            spotlightScrim.copy(alpha = 0.35f)
                         )
                     )
                     val vertScrim = Brush.verticalGradient(
                         colors = listOf(
                             Color.Transparent,
-                            PitchBlack.copy(alpha = 0.9f)
+                            spotlightScrim.copy(alpha = 0.9f)
                         )
                     )
                     onDrawWithContent {
@@ -3724,7 +3746,7 @@ private fun SpotlightPlaylistHeroCard(
                         style = MaterialTheme.typography.headlineMedium.copy(
                             fontWeight = FontWeight.ExtraBold
                         ),
-                        color = AlabasterWhite,
+                        color = PhotoForegroundColor,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.fillMaxWidth()
@@ -3732,7 +3754,7 @@ private fun SpotlightPlaylistHeroCard(
                     Text(
                         text = playlist.subtitle,
                         style = MaterialTheme.typography.bodyMedium,
-                        color = MutedSlate,
+                        color = PhotoMutedColor,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
@@ -3759,7 +3781,7 @@ private fun SpotlightPlaylistHeroCard(
                         Icon(
                             imageVector = Icons.Default.PlayArrow,
                             contentDescription = "Play Playlist",
-                            tint = PitchBlack,
+                            tint = ThemeOnPrimary,
                             modifier = Modifier.size(26.dp)
                         )
                     }
@@ -3969,7 +3991,7 @@ private fun LivePlaylistCarouselCard(
                     .padding(10.dp)
                     .size(38.dp)
                     .clip(CircleShape)
-                    .background(PitchBlack.copy(alpha = 0.78f))
+                    .background(PhotoScrimColor.copy(alpha = 0.78f))
                     .border(0.75.dp, ElectricMint.copy(alpha = 0.65f), CircleShape)
                     .clickable(onClick = onQuickPlayClick),
                 contentAlignment = Alignment.Center
@@ -4045,7 +4067,7 @@ private fun PickedForYouTrackCard(
                     .padding(10.dp)
                     .size(38.dp)
                     .clip(CircleShape)
-                    .background(if (isCurrentTrack) ElectricMint else PitchBlack.copy(alpha = 0.78f))
+                    .background(if (isCurrentTrack) ElectricMint else PhotoScrimColor.copy(alpha = 0.78f))
                     .border(
                         width = 0.75.dp,
                         color = ElectricMint.copy(alpha = 0.75f),
@@ -4056,7 +4078,7 @@ private fun PickedForYouTrackCard(
                 Icon(
                     imageVector = if (isCurrentTrack && isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
                     contentDescription = "Play ${song.title}",
-                    tint = if (isCurrentTrack) PitchBlack else ElectricMint,
+                    tint = if (isCurrentTrack) ThemeOnPrimary else ElectricMint,
                     modifier = Modifier.size(20.dp)
                 )
             }
@@ -4119,6 +4141,7 @@ private fun EditorialPlaylistCarouselCard(
             .clickable(onClick = onCardClick)
             .testTag("editorial_playlist_card_${playlist.id}")
     ) {
+        val cardScrim = PhotoScrimColor
         OptimizedArtworkImage(
             artworkUrl = playlist.artworkUrl,
             contentDescription = playlist.title,
@@ -4128,9 +4151,9 @@ private fun EditorialPlaylistCarouselCard(
                 .drawWithCache {
                     val overlayBrush = Brush.verticalGradient(
                         colors = listOf(
-                            PitchBlack.copy(alpha = 0.25f),
-                            PitchBlack.copy(alpha = 0.65f),
-                            PitchBlack.copy(alpha = 0.94f)
+                            cardScrim.copy(alpha = 0.25f),
+                            cardScrim.copy(alpha = 0.65f),
+                            cardScrim.copy(alpha = 0.94f)
                         )
                     )
                     val topStripeBrush = Brush.horizontalGradient(accentColors)
@@ -4166,7 +4189,7 @@ private fun EditorialPlaylistCarouselCard(
                     modifier = Modifier
                         .size(34.dp)
                         .clip(CircleShape)
-                        .background(PitchBlack.copy(alpha = 0.75f))
+                        .background(PhotoScrimColor.copy(alpha = 0.75f))
                         .border(0.75.dp, ElectricMint.copy(alpha = 0.6f), CircleShape)
                         .clickable(onClick = onQuickPlayClick),
                     contentAlignment = Alignment.Center
@@ -4186,7 +4209,7 @@ private fun EditorialPlaylistCarouselCard(
                     style = MaterialTheme.typography.titleMedium.copy(
                         fontWeight = FontWeight.ExtraBold
                     ),
-                    color = AlabasterWhite,
+                    color = PhotoForegroundColor,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.fillMaxWidth()
@@ -4194,7 +4217,7 @@ private fun EditorialPlaylistCarouselCard(
                 Text(
                     text = playlist.subtitle,
                     style = MaterialTheme.typography.bodySmall,
-                    color = MutedSlate,
+                    color = PhotoMutedColor,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
@@ -4273,7 +4296,7 @@ private fun TopChartSongRow(
                     modifier = Modifier
                         .size(48.dp)
                         .clip(RoundedCornerShape(12.dp))
-                        .background(PitchBlack.copy(alpha = 0.65f)),
+                        .background(PhotoScrimColor.copy(alpha = 0.65f)),
                     contentAlignment = Alignment.Center
                 ) {
                     CircularProgressIndicator(
@@ -4287,7 +4310,7 @@ private fun TopChartSongRow(
                     modifier = Modifier
                         .size(48.dp)
                         .clip(RoundedCornerShape(12.dp))
-                        .background(PitchBlack.copy(alpha = 0.55f)),
+                        .background(PhotoScrimColor.copy(alpha = 0.55f)),
                     contentAlignment = Alignment.Center
                 ) {
                     MiniWaveformIndicator(isPlaying = isPlaying)
@@ -5139,7 +5162,7 @@ private fun SearchArtistHeroCard(
                     shape = RoundedCornerShape(50),
                     colors = ButtonDefaults.buttonColors(
                         containerColor = ElectricMint,
-                        contentColor = PitchBlack
+                        contentColor = ThemeOnPrimary
                     ),
                     contentPadding = PaddingValues(horizontal = 18.dp, vertical = 10.dp),
                     modifier = Modifier
@@ -5390,7 +5413,7 @@ private fun SearchTopResultHeroCard(
                             modifier = Modifier
                                 .size(76.dp)
                                 .clip(RoundedCornerShape(16.dp))
-                                .background(PitchBlack.copy(alpha = 0.65f)),
+                                .background(PhotoScrimColor.copy(alpha = 0.65f)),
                             contentAlignment = Alignment.Center
                         ) {
                             CircularProgressIndicator(
@@ -5404,7 +5427,7 @@ private fun SearchTopResultHeroCard(
                             modifier = Modifier
                                 .size(76.dp)
                                 .clip(RoundedCornerShape(16.dp))
-                                .background(PitchBlack.copy(alpha = 0.55f)),
+                                .background(PhotoScrimColor.copy(alpha = 0.55f)),
                             contentAlignment = Alignment.Center
                         ) {
                             MiniWaveformIndicator(isPlaying = isPlaying)
@@ -5525,7 +5548,7 @@ private fun SearchTopResultHeroCard(
                     shape = RoundedCornerShape(50),
                     colors = ButtonDefaults.buttonColors(
                         containerColor = ElectricMint,
-                        contentColor = PitchBlack
+                        contentColor = ThemeOnPrimary
                     ),
                     contentPadding = PaddingValues(horizontal = 20.dp, vertical = 10.dp),
                     modifier = Modifier.testTag("top_result_play_button")
@@ -5873,7 +5896,7 @@ private fun LibraryTabScreenContent(
                                 Icon(
                                     imageVector = Icons.Filled.Add,
                                     contentDescription = "New playlist",
-                                    tint = PitchBlack,
+                                    tint = ThemeOnPrimary,
                                     modifier = Modifier.size(17.dp)
                                 )
                                 Text(
@@ -5881,7 +5904,7 @@ private fun LibraryTabScreenContent(
                                     style = MaterialTheme.typography.labelLarge.copy(
                                         fontWeight = FontWeight.ExtraBold
                                     ),
-                                    color = PitchBlack,
+                                    color = ThemeOnPrimary,
                                     maxLines = 1
                                 )
                             }
@@ -5996,7 +6019,7 @@ private fun LibraryTabScreenContent(
                                 shape = RoundedCornerShape(50),
                                 colors = ButtonDefaults.buttonColors(
                                     containerColor = ElectricMint,
-                                    contentColor = PitchBlack,
+                                    contentColor = ThemeOnPrimary,
                                     disabledContainerColor = CarbonElevated,
                                     disabledContentColor = MutedSlate
                                 ),
@@ -6007,7 +6030,7 @@ private fun LibraryTabScreenContent(
                             ) {
                                 if (isImportingPlaylist) {
                                     CircularProgressIndicator(
-                                        color = PitchBlack,
+                                        color = ThemeOnPrimary,
                                         strokeWidth = 2.dp,
                                         modifier = Modifier.size(18.dp)
                                     )
@@ -6068,7 +6091,7 @@ private fun LibraryTabScreenContent(
                             style = MaterialTheme.typography.labelLarge.copy(
                                 fontWeight = if (isSelected) FontWeight.ExtraBold else FontWeight.Medium
                             ),
-                            color = if (isSelected) PitchBlack else AlabasterWhite.copy(alpha = 0.85f),
+                            color = if (isSelected) ThemeOnPrimary else AlabasterWhite.copy(alpha = 0.85f),
                             maxLines = 1,
                             modifier = Modifier.padding(horizontal = 15.dp, vertical = 8.dp)
                         )
@@ -6085,8 +6108,8 @@ private fun LibraryTabScreenContent(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(18.dp))
-                        .background(Color.White.copy(alpha = 0.04f))
-                        .border(0.6.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(18.dp))
+                        .background(CarbonSurface)
+                        .border(0.6.dp, SubtleBorder, RoundedCornerShape(18.dp))
                         .padding(horizontal = 14.dp, vertical = 12.dp)
                         .testTag("library_listening_stats_card"),
                     verticalArrangement = Arrangement.spacedBy(10.dp)
@@ -6528,7 +6551,7 @@ private fun LibraryTabScreenContent(
                                     size = 36.dp,
                                     iconSize = 18.dp,
                                     isActive = false,
-                                    inactiveTint = PitchBlack,
+                                    inactiveTint = ThemeOnPrimary,
                                     containerColor = ElectricMint
                                 )
                             }
@@ -6595,7 +6618,7 @@ private fun LibraryTabScreenContent(
                             size = 36.dp,
                             iconSize = 18.dp,
                             isActive = false,
-                            inactiveTint = PitchBlack,
+                            inactiveTint = ThemeOnPrimary,
                             containerColor = ElectricMint
                         )
                     }
@@ -6748,7 +6771,7 @@ private fun LibraryTabScreenContent(
                                 size = 36.dp,
                                 iconSize = 19.dp,
                                 isActive = false,
-                                inactiveTint = PitchBlack,
+                                inactiveTint = ThemeOnPrimary,
                                 containerColor = ElectricMint
                             )
                             SoftTonalCircleIconButton(
@@ -6879,13 +6902,13 @@ private fun LibraryTabScreenContent(
                                     Icon(
                                         imageVector = Icons.Filled.PlayArrow,
                                         contentDescription = null,
-                                        tint = PitchBlack,
+                                        tint = ThemeOnPrimary,
                                         modifier = Modifier.size(16.dp)
                                     )
                                     Text(
                                         text = "Play All",
                                         style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.ExtraBold),
-                                        color = PitchBlack
+                                        color = ThemeOnPrimary
                                     )
                                 }
                             }
@@ -7184,7 +7207,7 @@ private fun OfflineDownloadsTabScreenContent(
                             shape = RoundedCornerShape(50),
                             colors = ButtonDefaults.buttonColors(
                                 containerColor = ElectricMint,
-                                contentColor = PitchBlack,
+                                contentColor = ThemeOnPrimary,
                                 disabledContainerColor = CarbonElevated,
                                 disabledContentColor = MutedSlate
                             ),
@@ -7472,7 +7495,7 @@ private fun OfflineDownloadsTabScreenContent(
                     },
                     colors = ButtonDefaults.buttonColors(
                         containerColor = SunsetCoral,
-                        contentColor = PitchBlack
+                        contentColor = ThemeOnPrimary
                     ),
                     modifier = Modifier.testTag("confirm_clear_downloads_button")
                 ) {
@@ -7496,7 +7519,7 @@ private fun OfflineStatBadge(
     modifier: Modifier = Modifier
 ) {
     Surface(
-        color = PitchBlack.copy(alpha = 0.55f),
+        color = CarbonElevated,
         shape = RoundedCornerShape(14.dp),
         modifier = modifier.border(
             width = 0.5.dp,
@@ -7539,6 +7562,7 @@ private fun OfflineStatBadge(
 @Composable
 private fun SettingsAndEqTabContent(
     equalizerState: EqualizerState,
+    themeState: AppThemeState,
     playbackSpeed: Float,
     playbackPitch: Float,
     sleepTimerState: SleepTimerState,
@@ -7555,6 +7579,9 @@ private fun SettingsAndEqTabContent(
     onSetAutoQueueRadio: (Boolean) -> Unit,
     onSetAutoDeviceProfilesEnabled: (Boolean) -> Unit,
     onSetOutputRoutePreset: (AudioOutputRoute, String) -> Unit,
+    onSelectThemePreset: (StudioThemePreset) -> Unit,
+    onSetAmoledPureBlack: (Boolean) -> Unit,
+    onSetDynamicArtworkTint: (Boolean) -> Unit,
     onStartSleepTimer: (Int, Boolean) -> Unit,
     onCancelSleepTimer: () -> Unit,
     onOpenTasteEditor: () -> Unit
@@ -7576,6 +7603,10 @@ private fun SettingsAndEqTabContent(
         onSetAutoQueueRadio = onSetAutoQueueRadio,
         onSetAutoDeviceProfilesEnabled = onSetAutoDeviceProfilesEnabled,
         onSetOutputRoutePreset = onSetOutputRoutePreset,
+        themeState = themeState,
+        onSelectThemePreset = onSelectThemePreset,
+        onSetAmoledPureBlack = onSetAmoledPureBlack,
+        onSetDynamicArtworkTint = onSetDynamicArtworkTint,
         selectedTasteGenres = selectedTasteGenres,
         onOpenTasteEditor = onOpenTasteEditor,
         onStartSleepTimer = onStartSleepTimer,
@@ -7709,7 +7740,7 @@ private fun SongTrackRowCard(
                     modifier = Modifier
                         .size(48.dp)
                         .clip(RoundedCornerShape(12.dp))
-                        .background(PitchBlack.copy(alpha = 0.65f)),
+                        .background(PhotoScrimColor.copy(alpha = 0.65f)),
                     contentAlignment = Alignment.Center
                 ) {
                     CircularProgressIndicator(
@@ -7723,7 +7754,7 @@ private fun SongTrackRowCard(
                     modifier = Modifier
                         .size(48.dp)
                         .clip(RoundedCornerShape(12.dp))
-                        .background(PitchBlack.copy(alpha = 0.55f)),
+                        .background(PhotoScrimColor.copy(alpha = 0.55f)),
                     contentAlignment = Alignment.Center
                 ) {
                     MiniWaveformIndicator(isPlaying = isPlaying)
@@ -7915,7 +7946,7 @@ private fun CreateCustomPlaylistDialog(
                 enabled = title.isNotBlank(),
                 colors = ButtonDefaults.buttonColors(
                     containerColor = ElectricMint,
-                    contentColor = PitchBlack
+                    contentColor = ThemeOnPrimary
                 ),
                 modifier = Modifier.testTag("create_playlist_confirm_button")
             ) {
@@ -8094,7 +8125,7 @@ private fun AddToPlaylistBottomSheet(
                     enabled = newPlaylistName.isNotBlank(),
                     colors = ButtonDefaults.buttonColors(
                         containerColor = ElectricMint,
-                        contentColor = PitchBlack
+                        contentColor = ThemeOnPrimary
                     ),
                     shape = RoundedCornerShape(14.dp)
                 ) {

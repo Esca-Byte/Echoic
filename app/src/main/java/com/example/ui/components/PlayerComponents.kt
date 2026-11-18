@@ -169,6 +169,7 @@ import androidx.compose.material.icons.outlined.Person
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.ui.graphics.takeOrElse
 import androidx.compose.ui.zIndex
 import androidx.core.content.FileProvider
 import coil.compose.AsyncImage
@@ -195,11 +196,16 @@ import com.example.ui.theme.DimSlate
 import com.example.ui.theme.ElectricMint
 import com.example.ui.theme.GlassSurface
 import com.example.ui.theme.JetBrainsMonoFontFamily
+import com.example.ui.theme.LocalStudioPalette
 import com.example.ui.theme.MutedSlate
 import com.example.ui.theme.NeonViolet
+import com.example.ui.theme.PhotoForegroundColor
+import com.example.ui.theme.PhotoMutedColor
+import com.example.ui.theme.PhotoScrimColor
 import com.example.ui.theme.PitchBlack
 import com.example.ui.theme.SubtleBorder
 import com.example.ui.theme.SunsetCoral
+import com.example.ui.theme.ThemeOnPrimary
 import java.io.File
 import java.io.FileOutputStream
 import java.util.Locale
@@ -222,27 +228,31 @@ fun SoftTonalCircleIconButton(
     size: Dp = 42.dp,
     iconSize: Dp = 20.dp,
     isActive: Boolean = false,
-    activeTint: Color = ElectricMint,
-    inactiveTint: Color = AlabasterWhite,
-    containerColor: Color = CarbonSurface,
+    activeTint: Color = Color.Unspecified,
+    inactiveTint: Color = Color.Unspecified,
+    containerColor: Color = Color.Unspecified,
     enabled: Boolean = true
 ) {
+    val resolvedActiveTint = activeTint.takeOrElse { ElectricMint }
+    val resolvedInactiveTint = inactiveTint.takeOrElse { AlabasterWhite }
+    val baseContainer = containerColor.takeOrElse { CarbonSurface }
+
     val resolvedContainer = when {
         !enabled -> CarbonSurface.copy(alpha = 0.55f)
-        isActive -> activeTint.copy(alpha = 0.16f)
-        containerColor == GlassSurface -> CarbonSurface
-        else -> containerColor
+        isActive -> resolvedActiveTint.copy(alpha = 0.16f)
+        baseContainer == GlassSurface -> CarbonSurface
+        else -> baseContainer
     }
     val resolvedBorderColor = when {
         !enabled -> SubtleBorder.copy(alpha = 0.35f)
-        isActive -> activeTint.copy(alpha = 0.72f)
-        containerColor == ElectricMint -> ElectricMint
+        isActive -> resolvedActiveTint.copy(alpha = 0.72f)
+        baseContainer == ElectricMint -> ElectricMint
         else -> SubtleBorder
     }
     val resolvedTint = when {
         !enabled -> DimSlate
-        isActive -> activeTint
-        else -> inactiveTint
+        isActive -> resolvedActiveTint
+        else -> resolvedInactiveTint
     }
 
     Box(
@@ -279,19 +289,20 @@ fun PlatformBadgePill(
     darkBackgroundOverlay: Boolean = false
 ) {
     val cleanLabel = platform.trim().ifBlank { "JioSaavn" }.uppercase()
-    val accentColor = remember(cleanLabel) {
+    val themeMintColor = ElectricMint
+    val accentColor = remember(cleanLabel, themeMintColor) {
         when {
             cleanLabel.contains("SPOTIFY") -> Color(0xFF1DB954)
             cleanLabel.contains("YOUTUBE") || cleanLabel.contains("YT") -> Color(0xFFFF3B5C)
             cleanLabel.contains("SAAVN") -> Color(0xFF2BC5B4)
             cleanLabel.contains("DEEZER") -> Color(0xFFA855F7)
-            cleanLabel.contains("CUSTOM") -> ElectricMint
-            else -> ElectricMint
+            cleanLabel.contains("CUSTOM") -> themeMintColor
+            else -> themeMintColor
         }
     }
 
     val containerBg = if (darkBackgroundOverlay) {
-        PitchBlack.copy(alpha = 0.78f)
+        PhotoScrimColor.copy(alpha = 0.78f)
     } else {
         accentColor.copy(alpha = 0.15f)
     }
@@ -332,10 +343,14 @@ fun AnimatedFavoriteButton(
     contentDescription: String? = "Favorite",
     size: Dp = 38.dp,
     iconSize: Dp = 18.dp,
-    activeTint: Color = SunsetCoral,
-    inactiveTint: Color = MutedSlate,
-    containerColor: Color = CarbonElevated
+    activeTint: Color = Color.Unspecified,
+    inactiveTint: Color = Color.Unspecified,
+    containerColor: Color = Color.Unspecified
 ) {
+    val resolvedActiveTintArg = activeTint.takeOrElse { SunsetCoral }
+    val resolvedInactiveTintArg = inactiveTint.takeOrElse { MutedSlate }
+    val resolvedContainerArg = containerColor.takeOrElse { CarbonElevated }
+    val burstAccentColor = ElectricMint
     val haptic = LocalHapticFeedback.current
     val heartScale = remember { Animatable(1f) }
     val heartRotation = remember { Animatable(0f) }
@@ -398,17 +413,17 @@ fun AnimatedFavoriteButton(
     }
 
     val resolvedContainer by animateColorAsState(
-        targetValue = if (isFavorite) activeTint.copy(alpha = 0.18f) else containerColor,
+        targetValue = if (isFavorite) resolvedActiveTintArg.copy(alpha = 0.18f) else resolvedContainerArg,
         animationSpec = tween(durationMillis = 180),
         label = "favContainerColor"
     )
     val resolvedBorder by animateColorAsState(
-        targetValue = if (isFavorite) activeTint.copy(alpha = 0.65f) else SubtleBorder.copy(alpha = 0.65f),
+        targetValue = if (isFavorite) resolvedActiveTintArg.copy(alpha = 0.65f) else SubtleBorder.copy(alpha = 0.65f),
         animationSpec = tween(durationMillis = 180),
         label = "favBorderColor"
     )
     val resolvedTint by animateColorAsState(
-        targetValue = if (isFavorite) activeTint else inactiveTint,
+        targetValue = if (isFavorite) resolvedActiveTintArg else resolvedInactiveTintArg,
         animationSpec = tween(durationMillis = 180),
         label = "favIconTint"
     )
@@ -424,7 +439,7 @@ fun AnimatedFavoriteButton(
                     val baseRadius = this.size.minDimension * 0.48f
                     val ringRadius = baseRadius * (0.75f + p * 0.72f)
                     drawCircle(
-                        color = activeTint.copy(alpha = 0.55f * fade),
+                        color = resolvedActiveTintArg.copy(alpha = 0.55f * fade),
                         radius = ringRadius,
                         style = Stroke(width = 2.dp.toPx() * fade)
                     )
@@ -436,7 +451,7 @@ fun AnimatedFavoriteButton(
                         val angle = (i * 60f - 15f) * (Math.PI.toFloat() / 180f)
                         val px = center.x + cos(angle) * orbitRadius
                         val py = center.y + sin(angle) * orbitRadius
-                        val dotColor = if (i % 2 == 0) activeTint else ElectricMint
+                        val dotColor = if (i % 2 == 0) resolvedActiveTintArg else burstAccentColor
                         drawCircle(
                             color = dotColor.copy(alpha = 0.85f * fade),
                             radius = dotRadius,
@@ -514,13 +529,25 @@ fun OptimizedArtworkImage(
 @Composable
 fun rememberDynamicArtworkGlow(artworkUrl: String): Pair<Color, Color> {
     val context = LocalContext.current
-    var targetPrimary by remember(artworkUrl) { mutableStateOf(ElectricMint) }
-    var targetSecondary by remember(artworkUrl) { mutableStateOf(NeonViolet) }
+    val studioPalette = LocalStudioPalette.current
+    val themePrimary = studioPalette.primary
+    val themeSecondary = studioPalette.secondary
+    val themeTertiary = studioPalette.tertiary
+    val themeCoral = studioPalette.accentCoral
+    val useDynamicTint = studioPalette.dynamicArtworkTint
 
-    LaunchedEffect(artworkUrl) {
+    var targetPrimary by remember(artworkUrl, themePrimary, useDynamicTint) { mutableStateOf(themePrimary) }
+    var targetSecondary by remember(artworkUrl, themeSecondary, useDynamicTint) { mutableStateOf(themeSecondary) }
+
+    LaunchedEffect(artworkUrl, useDynamicTint, themePrimary, themeTertiary) {
+        if (!useDynamicTint) {
+            targetPrimary = themePrimary
+            targetSecondary = themeTertiary
+            return@LaunchedEffect
+        }
         if (artworkUrl.isBlank()) {
-            targetPrimary = ElectricMint
-            targetSecondary = NeonViolet
+            targetPrimary = themePrimary
+            targetSecondary = themeSecondary
             return@LaunchedEffect
         }
         val extracted = withContext(Dispatchers.IO) {
@@ -588,10 +615,10 @@ fun rememberDynamicArtworkGlow(artworkUrl: String): Pair<Color, Color> {
             targetSecondary = extracted.second
         } else {
             val palette = listOf(
-                Pair(ElectricMint, NeonViolet),
-                Pair(CyberCyan, NeonViolet),
-                Pair(SunsetCoral, NeonViolet),
-                Pair(NeonViolet, CyberCyan)
+                Pair(themePrimary, themeSecondary),
+                Pair(themeTertiary, themeSecondary),
+                Pair(themeCoral, themeSecondary),
+                Pair(themeSecondary, themeTertiary)
             )
             val chosen = palette[abs(artworkUrl.hashCode()) % palette.size]
             targetPrimary = chosen.first
@@ -756,7 +783,7 @@ fun MiniPlayer(
                 ) {
                     AnimatedPlayPauseIcon(
                         isPlaying = isPlaying,
-                        tint = PitchBlack,
+                        tint = ThemeOnPrimary,
                         modifier = Modifier.size(21.dp)
                     )
                 }
@@ -776,6 +803,8 @@ fun MiniPlayer(
             }
 
             // Sleek Rounded Pill Progress Track along the bottom of MiniPlayer
+            val progressTrackBg = SubtleBorder.copy(alpha = 0.55f)
+            val progressGradientColors = listOf(ElectricMint, CyberCyan)
             Canvas(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -789,13 +818,13 @@ fun MiniPlayer(
                 val radius = CornerRadius(size.height / 2f, size.height / 2f)
 
                 drawRoundRect(
-                    color = SubtleBorder.copy(alpha = 0.55f),
+                    color = progressTrackBg,
                     size = size,
                     cornerRadius = radius
                 )
                 if (fraction > 0f) {
                     drawRoundRect(
-                        brush = Brush.horizontalGradient(listOf(ElectricMint, CyberCyan)),
+                        brush = Brush.horizontalGradient(progressGradientColors),
                         size = Size(width = (size.width * fraction).coerceAtLeast(size.height), height = size.height),
                         cornerRadius = radius
                     )
@@ -859,6 +888,7 @@ fun MiniWaveformIndicator(
         label = "miniWaveActiveLevel"
     )
 
+    val waveBarColor = ElectricMint
     Canvas(
         modifier = modifier
             .width(15.dp)
@@ -878,7 +908,7 @@ fun MiniWaveformIndicator(
             val y = (size.height - h) / 2f
 
             drawRoundRect(
-                color = ElectricMint,
+                color = waveBarColor,
                 topLeft = Offset(x, y),
                 size = Size(barWidth, h),
                 cornerRadius = CornerRadius(barWidth / 2f, barWidth / 2f)
@@ -993,21 +1023,25 @@ fun ExpandedPlayerSheet(
                     .blur(56.dp)
             )
 
+            val studioPalette = LocalStudioPalette.current
+            val backdropBase = studioPalette.background
+            val scrimMidAlpha = if (studioPalette.isLight) 0.80f else 0.72f
+            val scrimOverlayAlpha = if (studioPalette.isLight) 0.56f else 0.38f
             Box(
                 modifier = Modifier
                     .fillMaxSize()
                     .drawBehind {
-                        // Deep atmospheric tint from album cover + dark readability scrim
+                        // Deep atmospheric tint matched to active light/dark studio surface
                         drawRect(
                             brush = Brush.verticalGradient(
                                 colors = listOf(
-                                    ambientPrimary.copy(alpha = 0.36f),
-                                    ambientSecondary.copy(alpha = 0.28f),
-                                    PitchBlack.copy(alpha = 0.72f)
+                                    ambientPrimary.copy(alpha = if (studioPalette.isLight) 0.22f else 0.36f),
+                                    ambientSecondary.copy(alpha = if (studioPalette.isLight) 0.16f else 0.28f),
+                                    backdropBase.copy(alpha = scrimMidAlpha)
                                 )
                             )
                         )
-                        drawRect(color = PitchBlack.copy(alpha = 0.38f))
+                        drawRect(color = backdropBase.copy(alpha = scrimOverlayAlpha))
                     }
             )
         }
@@ -1299,19 +1333,23 @@ private fun FrostedGlassCircleIconButton(
     size: Dp = 44.dp,
     iconSize: Dp = 20.dp,
     isActive: Boolean = false,
-    activeTint: Color = ElectricMint,
-    inactiveTint: Color = AlabasterWhite,
-    containerColor: Color = CarbonSurface,
-    borderColor: Color = SubtleBorder
+    activeTint: Color = Color.Unspecified,
+    inactiveTint: Color = Color.Unspecified,
+    containerColor: Color = Color.Unspecified,
+    borderColor: Color = Color.Unspecified
 ) {
+    val resolvedActiveTint = activeTint.takeOrElse { ElectricMint }
+    val resolvedInactiveTint = inactiveTint.takeOrElse { AlabasterWhite }
+    val resolvedContainer = containerColor.takeOrElse { CarbonSurface }
+    val resolvedBorder = borderColor.takeOrElse { SubtleBorder }
     Box(
         modifier = modifier
             .size(size)
             .clip(CircleShape)
-            .background(if (isActive) activeTint.copy(alpha = 0.16f) else containerColor)
+            .background(if (isActive) resolvedActiveTint.copy(alpha = 0.16f) else resolvedContainer)
             .border(
                 width = 0.85.dp,
-                color = if (isActive) activeTint.copy(alpha = 0.75f) else borderColor,
+                color = if (isActive) resolvedActiveTint.copy(alpha = 0.75f) else resolvedBorder,
                 shape = CircleShape
             )
             .clickable(onClick = onClick),
@@ -1320,7 +1358,7 @@ private fun FrostedGlassCircleIconButton(
         Icon(
             imageVector = icon,
             contentDescription = contentDescription,
-            tint = if (isActive) activeTint else inactiveTint,
+            tint = if (isActive) resolvedActiveTint else resolvedInactiveTint,
             modifier = Modifier.size(iconSize)
         )
     }
@@ -1763,16 +1801,19 @@ fun InteractiveWaveformProgressBar(
         }
     }
 
-    val playedBrush = remember {
+    val waveAccent = ElectricMint
+    val waveUnplayed = AlabasterWhite
+    val playheadColor = AlabasterWhite
+    val playedBrush = remember(waveAccent) {
         Brush.verticalGradient(
-            colors = listOf(ElectricMint, ElectricMint.copy(alpha = 0.85f))
+            colors = listOf(waveAccent, waveAccent.copy(alpha = 0.85f))
         )
     }
-    val unplayedBrush = remember {
+    val unplayedBrush = remember(waveUnplayed) {
         Brush.verticalGradient(
             colors = listOf(
-                Color.White.copy(alpha = 0.34f),
-                Color.White.copy(alpha = 0.24f)
+                waveUnplayed.copy(alpha = 0.34f),
+                waveUnplayed.copy(alpha = 0.22f)
             )
         )
     }
@@ -1786,10 +1827,10 @@ fun InteractiveWaveformProgressBar(
                 .fillMaxWidth()
                 .height(54.dp)
                 .clip(RoundedCornerShape(20.dp))
-                .background(PitchBlack.copy(alpha = 0.42f))
+                .background(CarbonSurface.copy(alpha = 0.72f))
                 .border(
                     width = 0.85.dp,
-                    color = if (isScrubbing) ElectricMint.copy(alpha = 0.65f) else Color.White.copy(alpha = 0.18f),
+                    color = if (isScrubbing) ElectricMint.copy(alpha = 0.65f) else SubtleBorder,
                     shape = RoundedCornerShape(20.dp)
                 )
                 .padding(horizontal = 14.dp, vertical = 7.dp)
@@ -1862,11 +1903,11 @@ fun InteractiveWaveformProgressBar(
                     )
                 }
 
-                // Crisp Vertical White Playhead Bar
+                // Crisp Vertical Playhead Bar
                 val pillWidth = if (isScrubbing) 4.dp.toPx() else 3.dp.toPx()
                 val clampedX = playheadX.coerceIn(pillWidth / 2f, size.width - pillWidth / 2f)
                 drawRoundRect(
-                    color = AlabasterWhite,
+                    color = playheadColor,
                     topLeft = Offset(clampedX - pillWidth / 2f, 0f),
                     size = Size(pillWidth, size.height),
                     cornerRadius = CornerRadius(pillWidth / 2f, pillWidth / 2f)
@@ -2043,7 +2084,7 @@ private fun UpNextQueueTabContent(
                             Icon(
                                 imageVector = Icons.AutoMirrored.Outlined.PlaylistAdd,
                                 contentDescription = "Save queue as playlist",
-                                tint = PitchBlack,
+                                tint = ThemeOnPrimary,
                                 modifier = Modifier.size(13.dp)
                             )
                             Text(
@@ -2051,7 +2092,7 @@ private fun UpNextQueueTabContent(
                                 style = MaterialTheme.typography.labelSmall.copy(
                                     fontWeight = FontWeight.ExtraBold
                                 ),
-                                color = PitchBlack
+                                color = ThemeOnPrimary
                             )
                         }
                     }
@@ -2182,7 +2223,7 @@ private fun UpNextQueueTabContent(
                                 Box(
                                     modifier = Modifier
                                         .fillMaxSize()
-                                        .background(PitchBlack.copy(alpha = 0.52f)),
+                                        .background(PhotoScrimColor.copy(alpha = 0.52f)),
                                     contentAlignment = Alignment.Center
                                 ) {
                                     MiniWaveformIndicator(isPlaying = true)
@@ -2439,7 +2480,7 @@ private fun UpNextQueueTabContent(
                     },
                     colors = ButtonDefaults.buttonColors(
                         containerColor = ElectricMint,
-                        contentColor = PitchBlack
+                        contentColor = ThemeOnPrimary
                     ),
                     shape = RoundedCornerShape(50),
                     modifier = Modifier.testTag("confirm_save_queue_button")
@@ -2750,7 +2791,7 @@ private fun SyncedLyricsTabContent(
                                 Icon(
                                     imageVector = Icons.Outlined.Share,
                                     contentDescription = "Share Lyric Card",
-                                    tint = PitchBlack,
+                                    tint = ThemeOnPrimary,
                                     modifier = Modifier.size(13.dp)
                                 )
                                 Text(
@@ -2759,7 +2800,7 @@ private fun SyncedLyricsTabContent(
                                         fontWeight = FontWeight.ExtraBold,
                                         fontSize = 11.sp
                                     ),
-                                    color = PitchBlack,
+                                    color = ThemeOnPrimary,
                                     maxLines = 1,
                                     softWrap = false
                                 )
@@ -2919,10 +2960,18 @@ private fun SyncedLyricsTabContent(
                 .map { it.text }
         }
 
+        val themeMint = ElectricMint
+        val themeCoral = SunsetCoral
+        val themeViolet = NeonViolet
+        val themeCyan = CyberCyan
         val (themeStartColor, themeMidColor, themeAccentColor) = remember(
             selectedTheme,
             ambientPrimary,
-            ambientSecondary
+            ambientSecondary,
+            themeMint,
+            themeCoral,
+            themeViolet,
+            themeCyan
         ) {
             when (selectedTheme) {
                 LyricCardTheme.ALBUM_GLOW -> Triple(
@@ -2933,22 +2982,22 @@ private fun SyncedLyricsTabContent(
                 LyricCardTheme.ELECTRIC_MINT -> Triple(
                     Color(0xFF0A3625),
                     Color(0xFF091B24),
-                    ElectricMint
+                    themeMint
                 )
                 LyricCardTheme.SUNSET_CORAL -> Triple(
                     Color(0xFF3F1321),
                     Color(0xFF1F1028),
-                    SunsetCoral
+                    themeCoral
                 )
                 LyricCardTheme.CYBER_VIOLET -> Triple(
                     Color(0xFF281246),
                     Color(0xFF0D1E38),
-                    NeonViolet
+                    themeViolet
                 )
                 LyricCardTheme.MIDNIGHT_OLED -> Triple(
                     Color(0xFF141820),
                     Color(0xFF090B0E),
-                    CyberCyan
+                    themeCyan
                 )
             }
         }
@@ -3004,13 +3053,13 @@ private fun SyncedLyricsTabContent(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(24.dp))
-                        .background(PitchBlack)
+                        .background(PhotoScrimColor)
                         .background(
                             Brush.linearGradient(
                                 colors = listOf(
                                     themeStartColor,
                                     themeMidColor,
-                                    PitchBlack
+                                    PhotoScrimColor
                                 )
                             )
                         )
@@ -3036,14 +3085,14 @@ private fun SyncedLyricsTabContent(
                                 Text(
                                     text = currentTrack.title,
                                     style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.ExtraBold),
-                                    color = AlabasterWhite,
+                                    color = PhotoForegroundColor,
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
                                 )
                                 Text(
                                     text = currentTrack.artist,
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = AlabasterWhite.copy(alpha = 0.75f),
+                                    color = PhotoForegroundColor.copy(alpha = 0.78f),
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
                                 )
@@ -3059,7 +3108,7 @@ private fun SyncedLyricsTabContent(
                                         fontWeight = if (idx == 0) FontWeight.ExtraBold else FontWeight.SemiBold,
                                         lineHeight = 24.sp
                                     ),
-                                    color = if (idx == 0) themeAccentColor else AlabasterWhite.copy(alpha = 0.92f)
+                                    color = if (idx == 0) themeAccentColor else PhotoForegroundColor.copy(alpha = 0.94f)
                                 )
                             }
                         }
@@ -3072,7 +3121,7 @@ private fun SyncedLyricsTabContent(
                             Text(
                                 text = currentTrack.albumName.ifBlank { "Echoic Studio Sessions" },
                                 style = MaterialTheme.typography.labelSmall,
-                                color = MutedSlate,
+                                color = PhotoMutedColor,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
                             )
@@ -3246,7 +3295,7 @@ private fun SyncedLyricsTabContent(
                         shape = RoundedCornerShape(50),
                         colors = ButtonDefaults.buttonColors(
                             containerColor = themeAccentColor,
-                            contentColor = PitchBlack
+                            contentColor = PhotoScrimColor
                         ),
                         modifier = Modifier
                             .weight(1f)
@@ -3254,7 +3303,7 @@ private fun SyncedLyricsTabContent(
                     ) {
                         if (isRenderingShareImage) {
                             CircularProgressIndicator(
-                                color = PitchBlack,
+                                color = PhotoScrimColor,
                                 strokeWidth = 2.dp,
                                 modifier = Modifier.size(16.dp)
                             )
@@ -3603,7 +3652,8 @@ private fun PlayerTransportSection(
                 label = "playBtnSize"
             )
 
-            // Centerpiece Glowing Green Play/Pause Button with Soft Radial Halo
+            // Centerpiece Glowing Play/Pause Button with Soft Radial Halo
+            val haloColor = ElectricMint
             Box(
                 modifier = Modifier
                     .size(84.dp)
@@ -3611,8 +3661,8 @@ private fun PlayerTransportSection(
                         drawCircle(
                             brush = Brush.radialGradient(
                                 colors = listOf(
-                                    ElectricMint.copy(alpha = 0.42f),
-                                    ElectricMint.copy(alpha = 0.14f),
+                                    haloColor.copy(alpha = 0.42f),
+                                    haloColor.copy(alpha = 0.14f),
                                     Color.Transparent
                                 )
                             ),
@@ -3633,7 +3683,7 @@ private fun PlayerTransportSection(
                 ) {
                     AnimatedPlayPauseIcon(
                         isPlaying = isPlaying,
-                        tint = PitchBlack,
+                        tint = ThemeOnPrimary,
                         modifier = Modifier.size(32.dp)
                     )
                 }
@@ -3840,7 +3890,7 @@ fun SleepTimerBottomSheet(
                                         .clip(CircleShape)
                                         .background(
                                             if (isSelected) ElectricMint
-                                            else PitchBlack.copy(alpha = 0.55f)
+                                            else CarbonSurface
                                         )
                                         .border(
                                             width = 0.75.dp,
@@ -3855,7 +3905,7 @@ fun SleepTimerBottomSheet(
                                             fontFamily = JetBrainsMonoFontFamily,
                                             fontWeight = FontWeight.Bold
                                         ),
-                                        color = if (isSelected) PitchBlack else MutedSlate
+                                        color = if (isSelected) ThemeOnPrimary else MutedSlate
                                     )
                                 }
 

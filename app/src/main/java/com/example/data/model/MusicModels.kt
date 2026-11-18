@@ -287,3 +287,24 @@ data class TimeOfDayShelfData(
     val playlists: List<PlaylistItem> = emptyList()
 )
 
+@Serializable
+enum class StudioThemePreset(
+    val displayName: String,
+    val vibeSubtitle: String,
+    val isLight: Boolean = false
+) {
+    OBSIDIAN_STUDIO("Obsidian Studio", "OLED black & Mint", isLight = false),
+    CHAMPAGNE_VINYL("Champagne Vinyl", "Espresso & Gold", isLight = false),
+    MIDNIGHT_VELVET("Midnight Velvet", "Nocturnal plum & Orchid", isLight = false),
+    NORDIC_FROST("Nordic Frost", "Fjord slate & Ice", isLight = false),
+    CRIMSON_VELVET("Crimson Velvet", "Carbon onyx & Ruby", isLight = false),
+    PAPER_DAYLIGHT("Paper Daylight", "Warm stone & Emerald", isLight = true)
+}
+
+@Immutable
+@Serializable
+data class AppThemeState(
+    val selectedTheme: StudioThemePreset = StudioThemePreset.OBSIDIAN_STUDIO,
+    val amoledPureBlack: Boolean = false,
+    val dynamicArtworkTint: Boolean = true
+)
