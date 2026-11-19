@@ -1,17 +1,26 @@
 package com.example.ui.screens
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.slideOutVertically
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -371,7 +380,29 @@ fun HomeScreen(
             }
         ) { innerPadding ->
             Box(modifier = Modifier.fillMaxSize()) {
-                when (selectedBottomTab) {
+                AnimatedContent(
+                    targetState = selectedBottomTab,
+                    transitionSpec = {
+                        val forward = targetState.ordinal >= initialState.ordinal
+                        val enterOffset = { fullWidth: Int -> if (forward) fullWidth / 7 else -fullWidth / 7 }
+                        val exitOffset = { fullWidth: Int -> if (forward) -fullWidth / 9 else fullWidth / 9 }
+                        (fadeIn(tween(210)) + slideInHorizontally(
+                            animationSpec = spring(
+                                dampingRatio = Spring.DampingRatioNoBouncy,
+                                stiffness = Spring.StiffnessMediumLow
+                            ),
+                            initialOffsetX = enterOffset
+                        )).togetherWith(
+                            fadeOut(tween(150)) + slideOutHorizontally(
+                                animationSpec = tween(160),
+                                targetOffsetX = exitOffset
+                            )
+                        )
+                    },
+                    label = "bottomNavTabTransition",
+                    modifier = Modifier.fillMaxSize()
+                ) { activeBottomTab ->
+                when (activeBottomTab) {
                     BottomNavTab.HOME -> {
                         RichHomeTabContent(
                             moodCategories = viewModel.moodCategories,
@@ -540,12 +571,28 @@ fun HomeScreen(
                         )
                     }
                 }
+                }
 
                 // Dedicated Playlist Detail Screen Overlay
                 AnimatedVisibility(
                     visible = selectedPlaylist != null,
-                    enter = slideInHorizontally(initialOffsetX = { it }) + fadeIn(),
-                    exit = slideOutHorizontally(targetOffsetX = { it }) + fadeOut()
+                    enter = slideInHorizontally(
+                        animationSpec = spring(
+                            dampingRatio = Spring.DampingRatioNoBouncy,
+                            stiffness = Spring.StiffnessMediumLow
+                        ),
+                        initialOffsetX = { it / 3 }
+                    ) + fadeIn(tween(200)) + scaleIn(
+                        initialScale = 0.96f,
+                        animationSpec = spring(
+                            dampingRatio = Spring.DampingRatioNoBouncy,
+                            stiffness = Spring.StiffnessMediumLow
+                        )
+                    ),
+                    exit = slideOutHorizontally(
+                        animationSpec = tween(190),
+                        targetOffsetX = { it / 3 }
+                    ) + fadeOut(tween(160)) + scaleOut(targetScale = 0.97f, animationSpec = tween(170))
                 ) {
                     selectedPlaylist?.let { activePlaylist ->
                         val isPlaylistSaved = remember(importedPlaylists, activePlaylist.id, activePlaylist.remotePlaylistId) {
@@ -603,8 +650,23 @@ fun HomeScreen(
                 // Dedicated Artist Hub Screen Overlay
                 AnimatedVisibility(
                     visible = selectedArtistProfile != null,
-                    enter = slideInHorizontally(initialOffsetX = { it }) + fadeIn(),
-                    exit = slideOutHorizontally(targetOffsetX = { it }) + fadeOut()
+                    enter = slideInHorizontally(
+                        animationSpec = spring(
+                            dampingRatio = Spring.DampingRatioNoBouncy,
+                            stiffness = Spring.StiffnessMediumLow
+                        ),
+                        initialOffsetX = { it / 3 }
+                    ) + fadeIn(tween(200)) + scaleIn(
+                        initialScale = 0.96f,
+                        animationSpec = spring(
+                            dampingRatio = Spring.DampingRatioNoBouncy,
+                            stiffness = Spring.StiffnessMediumLow
+                        )
+                    ),
+                    exit = slideOutHorizontally(
+                        animationSpec = tween(190),
+                        targetOffsetX = { it / 3 }
+                    ) + fadeOut(tween(160)) + scaleOut(targetScale = 0.97f, animationSpec = tween(170))
                 ) {
                     selectedArtistProfile?.let { activeArtist ->
                         val isFollowing = remember(followedArtists, activeArtist.name) {
@@ -645,8 +707,23 @@ fun HomeScreen(
                 // Dedicated Album / Single Detail Screen Overlay
                 AnimatedVisibility(
                     visible = selectedAlbumDetail != null,
-                    enter = slideInHorizontally(initialOffsetX = { it }) + fadeIn(),
-                    exit = slideOutHorizontally(targetOffsetX = { it }) + fadeOut()
+                    enter = slideInHorizontally(
+                        animationSpec = spring(
+                            dampingRatio = Spring.DampingRatioNoBouncy,
+                            stiffness = Spring.StiffnessMediumLow
+                        ),
+                        initialOffsetX = { it / 3 }
+                    ) + fadeIn(tween(200)) + scaleIn(
+                        initialScale = 0.96f,
+                        animationSpec = spring(
+                            dampingRatio = Spring.DampingRatioNoBouncy,
+                            stiffness = Spring.StiffnessMediumLow
+                        )
+                    ),
+                    exit = slideOutHorizontally(
+                        animationSpec = tween(190),
+                        targetOffsetX = { it / 3 }
+                    ) + fadeOut(tween(160)) + scaleOut(targetScale = 0.97f, animationSpec = tween(170))
                 ) {
                     selectedAlbumDetail?.let { activeAlbum ->
                         AlbumDetailScreen(
@@ -916,6 +993,38 @@ private fun SomifyBottomNavigationBar(
                     BottomNavTab.SETTINGS -> if (isSelected) Icons.Filled.Settings else Icons.Outlined.Settings
                 }
 
+                val pillScale by animateFloatAsState(
+                    targetValue = if (isSelected) 1.08f else 0.92f,
+                    animationSpec = spring(
+                        dampingRatio = Spring.DampingRatioMediumBouncy,
+                        stiffness = Spring.StiffnessMedium
+                    ),
+                    label = "bottomNavPillScale"
+                )
+                val iconScale by animateFloatAsState(
+                    targetValue = if (isSelected) 1.10f else 1f,
+                    animationSpec = spring(
+                        dampingRatio = Spring.DampingRatioMediumBouncy,
+                        stiffness = Spring.StiffnessMedium
+                    ),
+                    label = "bottomNavIconScale"
+                )
+                val pillBgColor by animateColorAsState(
+                    targetValue = if (isSelected) ElectricMint.copy(alpha = 0.18f) else Color.Transparent,
+                    animationSpec = tween(180),
+                    label = "bottomNavPillBg"
+                )
+                val pillBorderColor by animateColorAsState(
+                    targetValue = if (isSelected) ElectricMint.copy(alpha = 0.62f) else Color.Transparent,
+                    animationSpec = tween(180),
+                    label = "bottomNavPillBorder"
+                )
+                val iconTint by animateColorAsState(
+                    targetValue = if (isSelected) ElectricMint else MutedSlate,
+                    animationSpec = tween(180),
+                    label = "bottomNavIconTint"
+                )
+
                 NavigationBarItem(
                     selected = isSelected,
                     onClick = { onSelectTab(tab) },
@@ -923,13 +1032,15 @@ private fun SomifyBottomNavigationBar(
                         Box(
                             modifier = Modifier
                                 .size(40.dp)
+                                .graphicsLayer {
+                                    scaleX = pillScale
+                                    scaleY = pillScale
+                                }
                                 .clip(CircleShape)
-                                .background(
-                                    if (isSelected) ElectricMint.copy(alpha = 0.16f) else Color.Transparent
-                                )
+                                .background(pillBgColor)
                                 .border(
-                                    width = if (isSelected) 0.75.dp else 0.dp,
-                                    color = if (isSelected) ElectricMint.copy(alpha = 0.55f) else Color.Transparent,
+                                    width = if (isSelected) 0.85.dp else 0.dp,
+                                    color = pillBorderColor,
                                     shape = CircleShape
                                 ),
                             contentAlignment = Alignment.Center
@@ -937,8 +1048,13 @@ private fun SomifyBottomNavigationBar(
                             Icon(
                                 imageVector = icon,
                                 contentDescription = tab.label,
-                                tint = if (isSelected) ElectricMint else MutedSlate,
-                                modifier = Modifier.size(22.dp)
+                                tint = iconTint,
+                                modifier = Modifier
+                                    .size(22.dp)
+                                    .graphicsLayer {
+                                        scaleX = iconScale
+                                        scaleY = iconScale
+                                    }
                             )
                         }
                     },
@@ -4582,17 +4698,34 @@ private fun SearchTabScreenContent(
         } else if (selectedSearchFilter != SearchFilterType.ALL) {
             false
         } else {
-            val songMatchCount = filteredSongResults.count {
-                it.artist.contains(topMatchedArtist.name, ignoreCase = true)
-            }
-            val topSongExactTitleMatch = filteredSongResults.firstOrNull()?.let { firstSong ->
-                firstSong.title.equals(activeQuery.trim(), ignoreCase = true)
-            } ?: false
+            val cleanActiveQuery = activeQuery.trim()
+                .replace(Regex("\\b(by|song|songs|track|play)\\b", RegexOption.IGNORE_CASE), " ")
+                .replace(Regex("\\s+"), " ")
+                .trim()
+            val firstSong = filteredSongResults.firstOrNull()
+            val topSongTitleClean = firstSong?.title
+                ?.replace(Regex("\\s*\\(.*?\\)|\\s*\\[.*?]"), "")
+                ?.trim()
+                .orEmpty()
 
-            // Promote Prominent Artist Hero Card first whenever query matches an artist strongly or dominates returned songs
-            (topMatchedArtist.relevanceScore >= 85 && (!topSongExactTitleMatch || topMatchedArtist.relevanceScore >= 170)) ||
-                songMatchCount >= 2 ||
-                filteredSongResults.isEmpty()
+            val topSongExactOrStrongMatch = firstSong != null && (
+                topSongTitleClean.equals(cleanActiveQuery, ignoreCase = true) ||
+                    firstSong.title.equals(cleanActiveQuery, ignoreCase = true) ||
+                    (cleanActiveQuery.contains(" ") &&
+                        topSongTitleClean.isNotBlank() &&
+                        cleanActiveQuery.contains(topSongTitleClean, ignoreCase = true) &&
+                        firstSong.artist.split(",", "&", " ").any { token ->
+                            token.length >= 3 && cleanActiveQuery.contains(token.trim(), ignoreCase = true)
+                        })
+                )
+
+            val queryIsDirectArtistName = topMatchedArtist.name.equals(cleanActiveQuery, ignoreCase = true) ||
+                (cleanActiveQuery.length >= 4 &&
+                    topMatchedArtist.name.startsWith(cleanActiveQuery, ignoreCase = true) &&
+                    !topSongExactOrStrongMatch)
+
+            // Promote Artist Hero Card first only when the user searched directly for an artist name (or no songs matched)
+            (queryIsDirectArtistName && !topSongExactOrStrongMatch) || filteredSongResults.isEmpty()
         }
     }
 
@@ -4873,6 +5006,91 @@ private fun SearchTabScreenContent(
             }
         }
 
+        // 2. Top Popular Song Hero Card & Songs Section (placed ABOVE playlists so song searches always surface top hits first!)
+        if (filteredSongResults.isNotEmpty()) {
+            val showSongHeroCard = !isHistoryIdleView && !shouldPromoteArtistFirst
+            val songsListItems = if (showSongHeroCard) filteredSongResults.drop(1) else filteredSongResults
+
+            if (showSongHeroCard) {
+                val topSong = filteredSongResults.first()
+                item(key = "search_top_result_hero_${topSong.id}", contentType = "top_result_hero") {
+                    val isCurrentTop = currentTrackId == topSong.id
+                    SearchTopResultHeroCard(
+                        song = topSong,
+                        isCurrentTrack = isCurrentTop,
+                        isPlaying = isCurrentTop && isPlaying,
+                        isResolving = isCurrentTop && isResolvingStream,
+                        isDownloaded = downloadedSongIds.contains(topSong.id),
+                        isDownloading = downloadingSongIds.contains(topSong.id),
+                        onPlayClick = {
+                            onClearFocus()
+                            onRecordSearchHistory(searchQuery)
+                            onPlaySong(topSong, emptyList())
+                        },
+                        onOpenArtistClick = { onOpenArtist(topSong.artist) },
+                        onAddToQueueClick = { onAddToQueue(topSong) },
+                        onToggleFavoriteClick = { onToggleFavorite(topSong) },
+                        onToggleDownloadClick = { onToggleDownload(topSong) }
+                    )
+                }
+            }
+
+            if (songsListItems.isNotEmpty()) {
+                item(key = "search_songs_header", contentType = "section_header") {
+                    Text(
+                        text = if (!isHistoryIdleView) {
+                            if (shouldPromoteArtistFirst && topMatchedArtist != null) {
+                                "Top Tracks • ${topMatchedArtist.name}"
+                            } else {
+                                "Popular & Regional Hits"
+                            }
+                        } else if (lastSearchedQuery.isNotBlank()) {
+                            "Recently Searched Songs • \"$lastSearchedQuery\""
+                        } else {
+                            "Recently Searched Songs"
+                        },
+                        style = MaterialTheme.typography.titleMedium.copy(
+                            fontWeight = FontWeight.Bold
+                        ),
+                        color = AlabasterWhite,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier
+                            .padding(top = 6.dp)
+                            .testTag("search_songs_section_header")
+                    )
+                }
+
+                itemsIndexed(
+                    items = songsListItems,
+                    key = { _, song -> "search_${song.id}" },
+                    contentType = { _, _ -> "song_track_row" }
+                ) { _, song ->
+                    val isCurrentTrack = currentTrackId == song.id
+                    SongTrackRowCard(
+                        song = song,
+                        isCurrentTrack = isCurrentTrack,
+                        isPlaying = isCurrentTrack && isPlaying,
+                        isResolving = isCurrentTrack && isResolvingStream,
+                        isDownloaded = downloadedSongIds.contains(song.id),
+                        isDownloading = downloadingSongIds.contains(song.id),
+                        isContainerless = isHistoryIdleView,
+                        onPlayClick = {
+                            onClearFocus()
+                            onRecordSearchHistory(searchQuery)
+                            onPlaySong(song, emptyList())
+                        },
+                        onAddToQueueClick = { onAddToQueue(song) },
+                        onToggleFavoriteClick = { onToggleFavorite(song) },
+                        onToggleDownloadClick = { onToggleDownload(song) },
+                        onAddToPlaylistClick = { onAddToPlaylist(song) },
+                        onOpenArtistClick = { onOpenArtist(song.artist) }
+                    )
+                }
+            }
+        }
+
+        // 3. Playlists Section
         if (filteredPlaylistResults.isNotEmpty()) {
             item(key = "search_playlists_header", contentType = "section_header") {
                 Row(
@@ -4928,91 +5146,6 @@ private fun SearchTabScreenContent(
                     onPlayClick = { onPlayPlaylist(playlist) },
                     onToggleFavoriteClick = { onToggleFavoritePlaylist(playlist) }
                 )
-            }
-        }
-
-        if (filteredSongResults.isNotEmpty()) {
-            // In live search without a promoted artist hero, show Top Song Hero Card first;
-            // In idle search history or when an Artist Hero Card is already promoted at the top, keep all song rows clean & flat!
-            val showSongHeroCard = !isHistoryIdleView && !shouldPromoteArtistFirst
-            val songsListItems = if (showSongHeroCard) filteredSongResults.drop(1) else filteredSongResults
-
-            if (showSongHeroCard) {
-                val topSong = filteredSongResults.first()
-                item(key = "search_top_result_hero_${topSong.id}", contentType = "top_result_hero") {
-                    val isCurrentTop = currentTrackId == topSong.id
-                    SearchTopResultHeroCard(
-                        song = topSong,
-                        isCurrentTrack = isCurrentTop,
-                        isPlaying = isCurrentTop && isPlaying,
-                        isResolving = isCurrentTop && isResolvingStream,
-                        isDownloaded = downloadedSongIds.contains(topSong.id),
-                        isDownloading = downloadingSongIds.contains(topSong.id),
-                        onPlayClick = {
-                            onClearFocus()
-                            onRecordSearchHistory(searchQuery)
-                            onPlaySong(topSong, emptyList())
-                        },
-                        onOpenArtistClick = { onOpenArtist(topSong.artist) },
-                        onAddToQueueClick = { onAddToQueue(topSong) },
-                        onToggleFavoriteClick = { onToggleFavorite(topSong) },
-                        onToggleDownloadClick = { onToggleDownload(topSong) }
-                    )
-                }
-            }
-
-            if (songsListItems.isNotEmpty()) {
-                item(key = "search_songs_header", contentType = "section_header") {
-                    Text(
-                        text = if (!isHistoryIdleView) {
-                            if (shouldPromoteArtistFirst && topMatchedArtist != null) {
-                                "Top Tracks • ${topMatchedArtist.name}"
-                            } else {
-                                "Songs"
-                            }
-                        } else if (lastSearchedQuery.isNotBlank()) {
-                            "Recently Searched Songs • \"$lastSearchedQuery\""
-                        } else {
-                            "Recently Searched Songs"
-                        },
-                        style = MaterialTheme.typography.titleMedium.copy(
-                            fontWeight = FontWeight.Bold
-                        ),
-                        color = AlabasterWhite,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier
-                            .padding(top = 6.dp)
-                            .testTag("search_songs_section_header")
-                    )
-                }
-
-                itemsIndexed(
-                    items = songsListItems,
-                    key = { _, song -> "search_${song.id}" },
-                    contentType = { _, _ -> "song_track_row" }
-                ) { _, song ->
-                    val isCurrentTrack = currentTrackId == song.id
-                    SongTrackRowCard(
-                        song = song,
-                        isCurrentTrack = isCurrentTrack,
-                        isPlaying = isCurrentTrack && isPlaying,
-                        isResolving = isCurrentTrack && isResolvingStream,
-                        isDownloaded = downloadedSongIds.contains(song.id),
-                        isDownloading = downloadingSongIds.contains(song.id),
-                        isContainerless = isHistoryIdleView,
-                        onPlayClick = {
-                            onClearFocus()
-                            onRecordSearchHistory(searchQuery)
-                            onPlaySong(song, emptyList())
-                        },
-                        onAddToQueueClick = { onAddToQueue(song) },
-                        onToggleFavoriteClick = { onToggleFavorite(song) },
-                        onToggleDownloadClick = { onToggleDownload(song) },
-                        onAddToPlaylistClick = { onAddToPlaylist(song) },
-                        onOpenArtistClick = { onOpenArtist(song.artist) }
-                    )
-                }
             }
         }
     }

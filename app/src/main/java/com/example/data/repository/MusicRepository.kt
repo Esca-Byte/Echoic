@@ -66,6 +66,25 @@ class MusicRepository(
     private val musicDao: MusicDao? = null
 ) {
 
+    companion object {
+        fun resolveStreamUserAgent(streamUrl: String): String {
+            return when {
+                streamUrl.contains("c=ANDROID_VR", ignoreCase = true) ->
+                    "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
+                streamUrl.contains("c=TVHTML5_SIMPLY_EMBEDDED_PLAYER", ignoreCase = true) ->
+                    "Mozilla/5.0 (PlayStation; PlayStation 5/2.26) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.0 Safari/605.1.15"
+                streamUrl.contains("c=IOS", ignoreCase = true) ->
+                    "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)"
+                streamUrl.contains("c=ANDROID_TESTSUITE", ignoreCase = true) ->
+                    "com.google.android.youtube/1.9 (Linux; U; Android 14; Pixel 8 Pro) gzip"
+                streamUrl.contains("c=ANDROID", ignoreCase = true) ->
+                    "com.google.android.youtube/19.45.38 (Linux; U; Android 14; Pixel 8 Pro) gzip"
+                else ->
+                    "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
+            }
+        }
+    }
+
     private val jsonParser = Json {
         ignoreUnknownKeys = true
         isLenient = true
@@ -734,7 +753,7 @@ class MusicRepository(
                 .get()
                 .header(
                     "User-Agent",
-                    "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+                    resolveStreamUserAgent(streamUrl)
                 )
                 .build()
 
@@ -1596,7 +1615,35 @@ class MusicRepository(
             }
             .take(16)
 
-        combinedFinal.also { finalQueue ->
+        val guaranteedQueue = if (combinedFinal.isNotEmpty()) {
+            combinedFinal
+        } else {
+            val relaxedPool = (saavnRecoList + ytAutomixList + primaryRawList + coArtistRawList + peerArtistSongs + tasteExpansionPool)
+                .distinctBy { it.id }
+                .filter { candidate ->
+                    candidate.id != seedSong.id &&
+                        candidate.id !in excludeIds &&
+                        candidate.durationMs !in 1..60_000L &&
+                        candidate.durationMs <= 720_000L
+                }
+                .take(16)
+
+            if (relaxedPool.isNotEmpty()) {
+                relaxedPool
+            } else {
+                val chartFallbackQuery = "${vibeProfile.language} trending hits".trim()
+                runCatching { searchJioSaavnCatalog(chartFallbackQuery) }
+                    .getOrDefault(emptyList())
+                    .distinctBy { it.id }
+                    .filter { candidate ->
+                        candidate.id != seedSong.id &&
+                            candidate.id !in excludeIds
+                    }
+                    .take(12)
+            }
+        }
+
+        guaranteedQueue.also { finalQueue ->
             finalQueue.forEach { songMetadataCache[it.id] = it }
         }
     }
@@ -1905,37 +1952,82 @@ class MusicRepository(
 
     /**
      * Fetches live search autocomplete suggestions as the user types in the Search bar.
+     * Prioritizes popular & country-famous songs matching the query (formatted as "Title - Artist")
+     * followed by YouTube Music India live suggestions and local taste matches.
      */
     suspend fun fetchSearchAutocompleteSuggestions(prefix: String): List<String> = withContext(Dispatchers.IO) {
         val trimmed = prefix.trim()
         if (trimmed.length < 2) return@withContext emptyList()
 
+        val cleanQuery = stripSearchConnectorWords(trimmed).ifBlank { trimmed }
+        val userCountry = resolveUserCountryCode()
         val suggestions = LinkedHashSet<String>()
 
-        // 1. YouTube Music / Google Music fast suggest endpoint
-        runCatching {
-            val url = "https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&q=${urlEncode(trimmed)}"
-            val text = httpGet(url)
-            val rootArr = jsonParser.parseToJsonElement(text).arrOrNull()
-            val itemsArr = rootArr?.getOrNull(1)?.arrOrNull()
-            itemsArr?.forEach { elem ->
-                val raw = (elem as? JsonPrimitive)?.contentOrNull?.trim().orEmpty()
-                val cleaned = raw
-                    .replace(Regex("\\b(lyrics|official video|video song|full video|mp3|download|status)\\b", RegexOption.IGNORE_CASE), "")
-                    .replace(Regex("\\s+"), " ")
-                    .trim()
-                if (cleaned.length in 2..42 && !cleaned.equals(trimmed, ignoreCase = true)) {
+        coroutineScope {
+            val saavnSongsDef = async {
+                runCatching { searchJioSaavnCatalog(cleanQuery, page = 1, limit = 6) }.getOrDefault(emptyList())
+            }
+            val itunesSongsDef = async {
+                runCatching { searchITunesCatalog(cleanQuery, countryCode = userCountry, limit = 5) }.getOrDefault(emptyList())
+            }
+            val ytSuggestDef = async {
+                runCatching {
+                    val url = "https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&gl=$userCountry&hl=en&q=${urlEncode(cleanQuery)}"
+                    val text = httpGet(url)
+                    val rootArr = jsonParser.parseToJsonElement(text).arrOrNull()
+                    val itemsArr = rootArr?.getOrNull(1)?.arrOrNull()
+                    itemsArr?.mapNotNull { elem ->
+                        val raw = (elem as? JsonPrimitive)?.contentOrNull?.trim().orEmpty()
+                        raw.replace(
+                            Regex("\\b(lyrics|official video|video song|full video|mp3|download|status|audio)\\b", RegexOption.IGNORE_CASE),
+                            ""
+                        )
+                            .replace(Regex("\\s+"), " ")
+                            .trim()
+                            .takeIf { it.length in 2..46 }
+                    }.orEmpty()
+                }.getOrDefault(emptyList())
+            }
+
+            val topCatalogSongs = (saavnSongsDef.await() + itunesSongsDef.await())
+                .distinctBy { "${canonicalSongTitle(it.title)}|${extractPrimaryArtistForLyrics(it.artist).lowercase()}" }
+
+            // 1. Put top country-famous & popular songs matching the query right at the top ("Song - Artist")
+            topCatalogSongs
+                .sortedByDescending { scoreSongRelevance(it, trimmed) }
+                .take(4)
+                .forEach { song ->
+                    val shortTitle = song.title
+                        .replace(Regex("\\s*\\(.*?\\)|\\s*\\[.*?]"), "")
+                        .trim()
+                    val primaryArtist = extractPrimaryArtistForLyrics(song.artist).trim()
+                    if (shortTitle.isNotBlank() && primaryArtist.isNotBlank() && !primaryArtist.equals("Unknown Artist", ignoreCase = true)) {
+                        val combined = "$shortTitle - $primaryArtist"
+                        if (combined.length <= 48) {
+                            suggestions.add(combined)
+                        }
+                    }
+                }
+
+            // 2. Add YouTube Music country-aware autocomplete suggestions
+            ytSuggestDef.await().forEach { cleaned ->
+                if (!cleaned.equals(trimmed, ignoreCase = true)) {
                     suggestions.add(cleaned)
                 }
             }
         }
 
-        // 2. Supplement with cached song/artist matches if needed
-        if (suggestions.size < 5) {
-            val lower = trimmed.lowercase()
+        // 3. Supplement with cached song/artist matches if needed
+        if (suggestions.size < 6) {
+            val lower = cleanQuery.lowercase()
             songMetadataCache.values.forEach { song ->
                 if (song.title.lowercase().startsWith(lower)) {
-                    suggestions.add(song.title)
+                    val primary = extractPrimaryArtistForLyrics(song.artist)
+                    if (primary.isNotBlank()) {
+                        suggestions.add("${song.title} - $primary")
+                    } else {
+                        suggestions.add(song.title)
+                    }
                 }
                 val primary = extractPrimaryArtistForLyrics(song.artist)
                 if (primary.lowercase().startsWith(lower)) {
@@ -1944,7 +2036,7 @@ class MusicRepository(
             }
         }
 
-        suggestions.take(7).toList()
+        suggestions.take(8).toList()
     }
 
     /**
@@ -2565,58 +2657,101 @@ class MusicRepository(
     )
 
     fun getOnboardingGenres(): List<OnboardingGenreOption> = listOf(
+        // Indian & Regional (12)
         OnboardingGenreOption("bollywood_hits", "Bollywood Hits", "Hindi Film & Romance", "Bollywood Hot Hits Hindi"),
+        OnboardingGenreOption("retro_hindi", "90s & 2000s Retro", "Classic Hindi Melodies", "90s 2000s Bollywood Retro Hindi Hits"),
         OnboardingGenreOption("punjabi_pop", "Punjabi Pop", "Bhangra & Urban Desi", "Diljit Dosanjh Karan Aujla Punjabi Hits"),
         OnboardingGenreOption("desi_hiphop", "Desi Hip-Hop", "Indian Rap & Bars", "Divine KRSNA Seedhe Maut Desi Hip Hop"),
         OnboardingGenreOption("indian_indie", "Indian Indie", "Acoustic & Unplugged", "Anuv Jain Prateek Kuhad Indian Indie"),
+        OnboardingGenreOption("indian_pop_viral", "Indian Pop & Viral", "Trending I-Pop & Reels", "Indian Pop Trending Hindi Hits"),
         OnboardingGenreOption("tamil_telugu", "Tamil & Telugu", "Kollywood & Tollywood", "Anirudh Ravichander Tamil Telugu Hits"),
+        OnboardingGenreOption("malayalam_kannada", "Malayalam & Kannada", "Mollywood & Sandalwood", "Malayalam Kannada Super Hits"),
         OnboardingGenreOption("sufi_soul", "Sufi & Soul", "Ghazal, Folk & Sufi", "Rahat Fateh Ali Khan Sufi Hits"),
+        OnboardingGenreOption("ghazal_classical", "Ghazals & Classical", "Timeless Raags & Ghazals", "Jagjit Singh Ghazal Classical Fusion"),
+        OnboardingGenreOption("bhojpuri_haryanvi", "Haryanvi & Regional", "Desi Beats & Folk Pop", "Haryanvi Bhojpuri Trending Hits"),
+        OnboardingGenreOption("devotional_spiritual", "Devotional & Peace", "Bhajans, Mantras & Soul", "Hindi Devotional Bhajan Aarti"),
+        // Global & Moods (12)
         OnboardingGenreOption("global_pop", "Global Pop", "Charting Pop Anthems", "Today Top Hits Pop Global"),
         OnboardingGenreOption("hiphop_rap", "Hip-Hop & Rap", "Global Trap & Rap", "RapCaviar Drake Kendrick Lamar"),
         OnboardingGenreOption("rnb_soul", "R&B & Soul", "Late Night & Smooth", "The Weeknd SZA R&B Hits"),
-        OnboardingGenreOption("lofi_chill", "Lo-Fi & Chill", "Study, Focus & Vibes", "Lofi Beats Chill Study"),
+        OnboardingGenreOption("kpop_hits", "K-Pop", "Korean Pop & Anthems", "BTS BLACKPINK NewJeans K-Pop Hits"),
+        OnboardingGenreOption("afrobeats_vibe", "Afrobeats & Amapiano", "Rhythmic Global Grooves", "Rema Burna Boy Tyla Afrobeats"),
+        OnboardingGenreOption("latin_reggaeton", "Latin & Reggaeton", "Urbano & Tropical Hits", "Bad Bunny Karol G Reggaeton Hits"),
+        OnboardingGenreOption("phonk_gym", "Phonk & Gym", "High-Energy Workout & Drift", "Phonk Gym Workout Hardstyle"),
         OnboardingGenreOption("electronic_edm", "Electronic & EDM", "House, Synth & Dance", "Electronic Dance Hits Calvin Harris"),
-        OnboardingGenreOption("rock_alt", "Rock & Alt", "Indie Rock & Anthems", "Coldplay Imagine Dragons Rock Hits")
+        OnboardingGenreOption("lofi_chill", "Lo-Fi & Chill", "Study, Focus & Vibes", "Lofi Beats Chill Study"),
+        OnboardingGenreOption("rock_alt", "Rock & Alt", "Indie Rock & Anthems", "Coldplay Imagine Dragons Rock Hits"),
+        OnboardingGenreOption("jazz_acoustic", "Jazz & Acoustic", "Warm Unplugged & Instrumental", "Acoustic Chill Jazz Cafe"),
+        OnboardingGenreOption("anime_gaming", "Anime & Gaming OSTs", "Epic Soundtracks & J-Rock", "Anime Openings Gaming Soundtrack")
     )
 
     fun getOnboardingArtists(): List<OnboardingArtistOption> = listOf(
+        // Indian & South Asian (20)
         OnboardingArtistOption("Arijit Singh", "India • Bollywood"),
         OnboardingArtistOption("Diljit Dosanjh", "India • Punjabi"),
+        OnboardingArtistOption("Karan Aujla", "India • Punjabi Pop"),
+        OnboardingArtistOption("Anirudh Ravichander", "India • Tamil / South"),
+        OnboardingArtistOption("A.R. Rahman", "India • Classical & Pop"),
+        OnboardingArtistOption("Shreya Ghoshal", "India • Playback"),
+        OnboardingArtistOption("Atif Aslam", "South Asia • Pop & Soul"),
+        OnboardingArtistOption("Pritam", "India • Bollywood"),
         OnboardingArtistOption("Anuv Jain", "India • Indie"),
         OnboardingArtistOption("AP Dhillon", "India • Punjabi"),
-        OnboardingArtistOption("Pritam", "India • Bollywood"),
-        OnboardingArtistOption("Shreya Ghoshal", "India • Playback"),
+        OnboardingArtistOption("Shubh", "India • Urban Punjabi"),
+        OnboardingArtistOption("Sidhu Moose Wala", "India • Punjabi Hip-Hop"),
         OnboardingArtistOption("Divine", "India • Desi Rap"),
-        OnboardingArtistOption("A.R. Rahman", "India • Classical & Pop"),
+        OnboardingArtistOption("Seedhe Maut", "India • Hip-Hop"),
+        OnboardingArtistOption("KR\$NA", "India • Desi Rap"),
+        OnboardingArtistOption("KK", "India • Evergreen Hindi"),
+        OnboardingArtistOption("Sonu Nigam", "India • Bollywood"),
+        OnboardingArtistOption("Badshah", "India • Party Pop"),
+        OnboardingArtistOption("Vishal Mishra", "India • Romance"),
+        OnboardingArtistOption("Sid Sriram", "India • South Melody"),
+        // Global (18)
         OnboardingArtistOption("The Weeknd", "Global • R&B / Pop"),
         OnboardingArtistOption("Taylor Swift", "Global • Pop"),
         OnboardingArtistOption("Drake", "Global • Hip-Hop"),
-        OnboardingArtistOption("Billie Eilish", "Global • Alt Pop"),
-        OnboardingArtistOption("Dua Lipa", "Global • Dance Pop"),
+        OnboardingArtistOption("Travis Scott", "Global • Trap / Rap"),
+        OnboardingArtistOption("Eminem", "Global • Hip-Hop"),
         OnboardingArtistOption("Kendrick Lamar", "Global • Rap"),
+        OnboardingArtistOption("SZA", "Global • R&B"),
+        OnboardingArtistOption("Billie Eilish", "Global • Alt Pop"),
+        OnboardingArtistOption("Post Malone", "Global • Pop / Rock"),
+        OnboardingArtistOption("Dua Lipa", "Global • Dance Pop"),
+        OnboardingArtistOption("Bruno Mars", "Global • Pop & Funk"),
         OnboardingArtistOption("Coldplay", "Global • Alt Rock"),
-        OnboardingArtistOption("Bruno Mars", "Global • Pop & Funk")
+        OnboardingArtistOption("Ed Sheeran", "Global • Acoustic Pop"),
+        OnboardingArtistOption("Ariana Grande", "Global • Pop & R&B"),
+        OnboardingArtistOption("Justin Bieber", "Global • Pop"),
+        OnboardingArtistOption("Bad Bunny", "Global • Latin Urbano"),
+        OnboardingArtistOption("BTS", "Global • K-Pop"),
+        OnboardingArtistOption("Lana Del Rey", "Global • Indie Pop")
     )
 
     suspend fun hydrateArtistPortraitUrls(
         artists: List<OnboardingArtistOption>
     ): List<OnboardingArtistOption> = withContext(Dispatchers.IO) {
-        coroutineScope {
-            artists.map { artist ->
-                async {
-                    if (artist.artworkUrl.isNotBlank()) return@async artist
-                    val picUrl = runCatching {
-                        val json = httpGet("https://api.deezer.com/search/artist?q=${urlEncode(artist.name)}&limit=2")
-                        val data = jsonParser.parseToJsonElement(json).objOrNull()?.get("data").arrOrNull()
-                        val first = data?.firstOrNull()?.objOrNull()
-                        (first?.get("picture_big")?.strOrNull()
-                            ?: first?.get("picture_medium")?.strOrNull()
-                            ?: "").replace("http://", "https://")
-                    }.getOrDefault("")
-                    if (picUrl.isNotBlank()) artist.copy(artworkUrl = picUrl) else artist
-                }
-            }.map { it.await() }
+        val result = ArrayList<OnboardingArtistOption>(artists.size)
+        for (chunk in artists.chunked(8)) {
+            val hydratedChunk = coroutineScope {
+                chunk.map { artist ->
+                    async {
+                        if (artist.artworkUrl.isNotBlank()) return@async artist
+                        val picUrl = runCatching {
+                            val json = httpGet("https://api.deezer.com/search/artist?q=${urlEncode(artist.name)}&limit=2")
+                            val data = jsonParser.parseToJsonElement(json).objOrNull()?.get("data").arrOrNull()
+                            val first = data?.firstOrNull()?.objOrNull()
+                            (first?.get("picture_big")?.strOrNull()
+                                ?: first?.get("picture_medium")?.strOrNull()
+                                ?: "").replace("http://", "https://")
+                        }.getOrDefault("")
+                        if (picUrl.isNotBlank()) artist.copy(artworkUrl = picUrl) else artist
+                    }
+                }.map { it.await() }
+            }
+            result.addAll(hydratedChunk)
         }
+        result
     }
 
     suspend fun searchOnboardingArtists(query: String): List<OnboardingArtistOption> = withContext(Dispatchers.IO) {
@@ -4681,9 +4816,66 @@ class MusicRepository(
         }
     }
 
+    private fun resolveUserCountryCode(): String {
+        val localeCountry = runCatching { java.util.Locale.getDefault().country.uppercase() }.getOrDefault("")
+        return if (localeCountry.length == 2 && localeCountry != "US") localeCountry else "IN"
+    }
+
+    private fun stripSearchConnectorWords(rawQuery: String): String {
+        return rawQuery
+            .replace(Regex("\\b(by|song|songs|track|play|listen to)\\b", RegexOption.IGNORE_CASE), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+    }
+
+    private data class ParsedSongSearchQuery(
+        val rawQuery: String,
+        val cleanApiQuery: String,
+        val explicitTitlePart: String,
+        val explicitArtistPart: String
+    )
+
+    private fun parseConversationalSearchQuery(rawQuery: String): ParsedSongSearchQuery {
+        val trimmed = rawQuery.trim()
+        val byMatch = Regex("^(.+?)\\s+by\\s+(.+)$", RegexOption.IGNORE_CASE).find(trimmed)
+        if (byMatch != null) {
+            val t = stripSearchConnectorWords(byMatch.groupValues[1]).ifBlank { byMatch.groupValues[1].trim() }
+            val a = stripSearchConnectorWords(byMatch.groupValues[2]).ifBlank { byMatch.groupValues[2].trim() }
+            val combined = "$t $a".replace(Regex("\\s+"), " ").trim()
+            return ParsedSongSearchQuery(
+                rawQuery = trimmed,
+                cleanApiQuery = combined.ifBlank { trimmed },
+                explicitTitlePart = t,
+                explicitArtistPart = a
+            )
+        }
+
+        val dashMatch = Regex("^(.+?)\\s+[-–—|]\\s+(.+)$").find(trimmed)
+        if (dashMatch != null) {
+            val t = stripSearchConnectorWords(dashMatch.groupValues[1]).ifBlank { dashMatch.groupValues[1].trim() }
+            val a = stripSearchConnectorWords(dashMatch.groupValues[2]).ifBlank { dashMatch.groupValues[2].trim() }
+            val combined = "$t $a".replace(Regex("\\s+"), " ").trim()
+            return ParsedSongSearchQuery(
+                rawQuery = trimmed,
+                cleanApiQuery = combined.ifBlank { trimmed },
+                explicitTitlePart = t,
+                explicitArtistPart = a
+            )
+        }
+
+        val cleaned = stripSearchConnectorWords(trimmed).ifBlank { trimmed }
+        return ParsedSongSearchQuery(
+            rawQuery = trimmed,
+            cleanApiQuery = cleaned,
+            explicitTitlePart = "",
+            explicitArtistPart = ""
+        )
+    }
+
     /**
-     * Live search across Official JioSaavn (full-length 320kbps MP4/AAC), YouTube Music InnerTube, Apple iTunes, and Deezer.
-     * Ranks results by query relevance and prioritizes full-length playable streams.
+     * Live search across Official JioSaavn (full-length 320kbps MP4/AAC), YouTube Music InnerTube,
+     * YouTube Video Music Catalog (regional/indie releases), Apple iTunes (country storefront), and Deezer.
+     * Ranks results by exact song+artist match, country popularity rank, cross-catalog consensus, and user taste.
      */
     fun search(query: String): Flow<List<SongItem>> = flow {
         val trimmed = query.trim()
@@ -4697,28 +4889,82 @@ class MusicRepository(
             return@flow
         }
 
+        val parsedQuery = parseConversationalSearchQuery(trimmed)
+        val apiQuery = parsedQuery.cleanApiQuery
+        val userCountry = resolveUserCountryCode()
+
         val combinedResults = coroutineScope {
             val saavnDeferred = async {
-                runCatching { searchJioSaavnCatalog(trimmed) }.getOrDefault(emptyList())
+                runCatching { searchJioSaavnCatalog(apiQuery, page = 1, limit = 30) }.getOrDefault(emptyList())
             }
-            val ytDeferred = async {
-                runCatching { searchInnerTubeWebRemix(trimmed) }.getOrDefault(emptyList())
+            val saavnTitleOnlyDeferred = async {
+                if (parsedQuery.explicitTitlePart.isNotBlank() &&
+                    parsedQuery.explicitArtistPart.isNotBlank() &&
+                    !parsedQuery.explicitTitlePart.equals(apiQuery, ignoreCase = true)
+                ) {
+                    val reqArtistTokens = lyricsArtistTokens(parsedQuery.explicitArtistPart)
+                    runCatching {
+                        searchJioSaavnCatalog(parsedQuery.explicitTitlePart, page = 1, limit = 20)
+                            .filter { cand ->
+                                val candTokens = lyricsArtistTokens("${cand.artist} ${cand.title}")
+                                reqArtistTokens.isNotEmpty() && reqArtistTokens.any { req ->
+                                    candTokens.any { c -> artistTokensMatch(req, c) }
+                                }
+                            }
+                    }.getOrDefault(emptyList())
+                } else {
+                    emptyList()
+                }
+            }
+            val ytMusicDeferred = async {
+                runCatching { searchInnerTubeWebRemix(apiQuery, countryCode = userCountry) }.getOrDefault(emptyList())
+            }
+            val ytVideoDeferred = async {
+                runCatching { searchYouTubeVideoCatalog(apiQuery, countryCode = userCountry) }.getOrDefault(emptyList())
             }
             val itunesDeferred = async {
-                runCatching { searchITunesCatalog(trimmed) }.getOrDefault(emptyList())
+                runCatching { searchITunesCatalog(apiQuery, countryCode = userCountry, limit = 25) }.getOrDefault(emptyList())
             }
             val deezerDeferred = async {
-                runCatching { searchDeezerCatalog(trimmed) }.getOrDefault(emptyList())
+                runCatching { searchDeezerCatalog(apiQuery) }.getOrDefault(emptyList())
             }
 
-            val saavnSongs = saavnDeferred.await()
-            val ytSongs = ytDeferred.await()
+            val saavnSongs = (saavnDeferred.await() + saavnTitleOnlyDeferred.await()).distinctBy { it.id }
+            val ytSongs = (ytMusicDeferred.await() + ytVideoDeferred.await()).distinctBy { it.id }
             val itunesSongs = itunesDeferred.await()
             val deezerSongs = deezerDeferred.await()
 
-            // Attach verified full-length JioSaavn 320kbps streams to InnerTube / iTunes / Deezer results where matched
-            val enrichWithFullSaavn = { song: SongItem ->
-                val matched = findBestMatchingTrack(song.title, song.artist, saavnSongs)
+            // Track catalog rank & cross-platform popularity consensus for each canonical (title, primaryArtist)
+            val popularityBonusMap = HashMap<String, Int>()
+            fun canonicalSongKey(song: SongItem): String {
+                val t = canonicalSongTitle(song.title).ifBlank { normalizeToken(song.title) }
+                val a = normalizeToken(extractPrimaryArtistForLyrics(song.artist)).ifBlank { normalizeToken(song.artist) }
+                return "$t|$a"
+            }
+            fun registerCatalogRanking(list: List<SongItem>, topWeight: Int, stepPenalty: Int) {
+                list.take(15).forEachIndexed { idx, item ->
+                    val key = canonicalSongKey(item)
+                    val rankBonus = (topWeight - idx * stepPenalty).coerceAtLeast(15)
+                    popularityBonusMap[key] = (popularityBonusMap[key] ?: 0) + rankBonus
+                }
+            }
+
+            // JioSaavn & YouTube Music IN carry highest weight for country-famous & popular songs
+            registerCatalogRanking(saavnSongs, topWeight = 155, stepPenalty = 9)
+            registerCatalogRanking(ytSongs, topWeight = 150, stepPenalty = 8)
+            registerCatalogRanking(itunesSongs, topWeight = 115, stepPenalty = 7)
+            registerCatalogRanking(deezerSongs, topWeight = 95, stepPenalty = 6)
+
+            // Only attach a JioSaavn stream to synthetic iTunes/Deezer items when title + artist + duration STRICTLY match.
+            // Never overwrite a YouTube item's streamUrl so YouTube tracks always play their authentic videoId!
+            val enrichSyntheticWithVerifiedSaavn = { song: SongItem ->
+                val matched = findBestMatchingTrack(
+                    targetTitle = song.title,
+                    targetArtist = song.artist,
+                    candidates = saavnSongs,
+                    targetDurationMs = song.durationMs,
+                    requireArtistMatch = true
+                )
                 if (matched != null && isFullLengthStreamUrl(matched.streamUrl)) {
                     song.copy(
                         streamUrl = matched.streamUrl,
@@ -4732,14 +4978,28 @@ class MusicRepository(
                 }
             }
 
-            val enrichedYt = ytSongs.map(enrichWithFullSaavn)
-            val enrichedItunes = itunesSongs.map(enrichWithFullSaavn)
-            val enrichedDeezer = deezerSongs.map(enrichWithFullSaavn)
+            ytSongs.forEach { songMetadataCache[it.id] = it }
+            val enrichedItunes = itunesSongs.map(enrichSyntheticWithVerifiedSaavn)
+            val enrichedDeezer = deezerSongs.map(enrichSyntheticWithVerifiedSaavn)
 
-            val allCandidates = (saavnSongs + enrichedYt + enrichedItunes + enrichedDeezer)
-                .distinctBy { "${normalizeToken(it.title)}|${normalizeToken(it.artist)}" }
+            val allCandidates = (saavnSongs + ytSongs + enrichedItunes + enrichedDeezer)
+                .distinctBy { "${canonicalSongTitle(it.title).ifBlank { normalizeToken(it.title) }}|${normalizeToken(it.artist)}" }
 
-            val scored = allCandidates.map { song -> song to scoreSongRelevance(song, trimmed) }
+            val countryFamousArtistsLower = (
+                indianIndieScene + punjabiPopScene + desiHipHopScene +
+                    bollywoodModernScene + southSuperhitsScene + sufiSoulScene
+                ).map { it.lowercase() }.toSet()
+
+            val scored = allCandidates.map { song ->
+                val baseScore = scoreSongRelevance(song, trimmed)
+                val popBonus = if (baseScore > 0) (popularityBonusMap[canonicalSongKey(song)] ?: 0) else 0
+                val artistLower = song.artist.lowercase()
+                val countryFamousBonus = if (baseScore > 0 && countryFamousArtistsLower.any { famous ->
+                        artistLower.contains(famous)
+                    }
+                ) 85 else 0
+                song to (baseScore + popBonus + countryFamousBonus)
+            }
             val positiveMatches = scored.filter { (_, score) -> score > 0 }
             (if (positiveMatches.isNotEmpty()) positiveMatches else scored)
                 .sortedByDescending { (_, score) -> score }
@@ -4751,33 +5011,102 @@ class MusicRepository(
     }.flowOn(Dispatchers.IO)
 
     internal fun scoreSongRelevance(song: SongItem, rawQuery: String): Int {
-        val normQuery = normalizeToken(rawQuery)
-        if (normQuery.isEmpty()) return 1
+        val parsed = parseConversationalSearchQuery(rawQuery)
+        val normCleanQuery = normalizeToken(parsed.cleanApiQuery)
+        if (normCleanQuery.isEmpty()) return 1
 
         val normTitle = normalizeToken(song.title)
+        val canonTitle = canonicalSongTitle(song.title).ifBlank { normTitle }
         val normArtist = normalizeToken(song.artist)
-        val normCombined = "$normTitle $normArtist"
-        val queryTokens = normQuery.split(" ").filter { it.isNotEmpty() }
+        val normAlbum = normalizeToken(song.albumName)
+        val normCombined = "$normTitle $normArtist $normAlbum"
+
+        val queryTokens = normCleanQuery.split(" ").filter { it.isNotEmpty() }
+        val artistCandTokens = lyricsArtistTokens("${song.artist} ${song.title}")
 
         var score = 0
-        if (normTitle == normQuery) score += 120
-        else if (normTitle.startsWith(normQuery)) score += 85
-        else if (normTitle.contains(normQuery)) score += 65
 
-        if (normArtist == normQuery) score += 90
-        else if (normArtist.contains(normQuery)) score += 55
+        // 1. Explicit "Title by Artist" or "Title - Artist" structure
+        if (parsed.explicitTitlePart.isNotBlank() && parsed.explicitArtistPart.isNotBlank()) {
+            val targetTitle = canonicalSongTitle(parsed.explicitTitlePart).ifBlank { normalizeToken(parsed.explicitTitlePart) }
+            val targetArtistTokens = lyricsArtistTokens(parsed.explicitArtistPart)
+            val titleExact = canonTitle == targetTitle || normTitle == targetTitle
+            val titlePartial = canonTitle.contains(targetTitle) || targetTitle.contains(canonTitle)
+            val artistMatched = targetArtistTokens.isNotEmpty() && targetArtistTokens.any { req ->
+                artistCandTokens.any { cand -> artistTokensMatch(req, cand) } || normArtist.contains(req)
+            }
 
-        val matchedTokens = queryTokens.count { token -> normCombined.contains(token) }
+            if (titleExact && artistMatched) {
+                score += 750
+            } else if (titlePartial && artistMatched) {
+                score += 520
+            } else if (titleExact && !artistMatched) {
+                // User explicitly asked for a specific artist, so demote same-title songs by other artists
+                score += 35
+            }
+        }
+
+        // 2. Standard title & artist matching
+        if (canonTitle == normCleanQuery || normTitle == normCleanQuery) {
+            score += 240
+        } else if (canonTitle.startsWith(normCleanQuery) || normTitle.startsWith(normCleanQuery)) {
+            score += 145
+        } else if (normTitle.contains(normCleanQuery)) {
+            score += 105
+        }
+
+        if (normArtist == normCleanQuery) {
+            score += 140
+        } else if (normArtist.contains(normCleanQuery)) {
+            score += 85
+        }
+
+        // 3. Multi-word query where some tokens match the song title and other tokens match the artist (e.g. "katana panjeta")
+        val titleMatchedTokens = queryTokens.filter { tok ->
+            canonTitle.contains(tok) || normTitle.contains(tok)
+        }
+        val artistMatchedTokens = queryTokens.filter { tok ->
+            normArtist.contains(tok) || artistCandTokens.any { cand -> artistTokensMatch(tok, cand) }
+        }
+        if (queryTokens.size >= 2) {
+            if (titleMatchedTokens.isNotEmpty() && artistMatchedTokens.isNotEmpty()) {
+                val distinctCovered = (titleMatchedTokens + artistMatchedTokens).toSet()
+                if (distinctCovered.size == queryTokens.size) {
+                    score += 620
+                    if (canonTitle == titleMatchedTokens.joinToString(" ")) {
+                        score += 160
+                    }
+                } else {
+                    score += 240
+                }
+            } else if (titleMatchedTokens.size < queryTokens.size && artistMatchedTokens.isEmpty()) {
+                // Only matched part of the query (e.g. matched "katana" but missed "panjeta" completely)
+                score -= 120
+            }
+        }
+
+        val matchedTokens = queryTokens.count { token ->
+            normCombined.contains(token) || artistCandTokens.any { cand -> artistTokensMatch(token, cand) }
+        }
         if (queryTokens.isNotEmpty() && matchedTokens == queryTokens.size) {
-            score += 70
+            score += 110
         } else {
             score += matchedTokens * 20
         }
 
-        if (score == 0) return 0
+        if (score <= 0) return 0
+
+        // Penalize karaoke / instrumental / 8d / ringtone covers when user didn't ask for them
+        val lowerRawTitle = song.title.lowercase()
+        val lowerRawQuery = rawQuery.lowercase()
+        if ((lowerRawTitle.contains("karaoke") || lowerRawTitle.contains("ringtone") || lowerRawTitle.contains("instrumental")) &&
+            !lowerRawQuery.contains("karaoke") && !lowerRawQuery.contains("instrumental")
+        ) {
+            score = (score - 140).coerceAtLeast(5)
+        }
 
         if (isFullLengthStreamUrl(song.streamUrl)) {
-            score += 45
+            score += 30
         }
         if (song.id.startsWith("saavn_")) {
             score += 20
@@ -4794,73 +5123,285 @@ class MusicRepository(
             .trim()
     }
 
+    /**
+     * Strictly verifies that a candidate song matches BOTH the target song title AND the target artist
+     * (plus duration proximity when available). Never matches unrelated artists who happen to have
+     * a song with the same title.
+     */
     private fun findBestMatchingTrack(
         targetTitle: String,
         targetArtist: String,
-        candidates: List<SongItem>
+        candidates: List<SongItem>,
+        targetDurationMs: Long = 0L,
+        requireArtistMatch: Boolean = true
     ): SongItem? {
         if (candidates.isEmpty()) return null
-        val normTitle = canonicalSongTitle(targetTitle).ifBlank { normalizeToken(targetTitle) }
-        val normArtist = normalizeToken(targetArtist)
-        val hasKnownArtist = normArtist.isNotEmpty() &&
-            normArtist != "unknown artist" &&
-            normArtist != "spotify artist"
+        val cleanedTargetTitle = cleanTrackTitleForLyrics(targetTitle, targetArtist)
+        val normTitle = canonicalSongTitle(cleanedTargetTitle).ifBlank { normalizeToken(cleanedTargetTitle) }
+        if (normTitle.isEmpty()) return null
 
-        candidates.firstOrNull { c ->
-            val cTitle = canonicalSongTitle(c.title).ifBlank { normalizeToken(c.title) }
-            val cArtist = normalizeToken(c.artist)
-            val titleMatches = cTitle.isNotEmpty() &&
-                (cTitle == normTitle || cTitle.contains(normTitle) || normTitle.contains(cTitle))
-            val artistMatches = !hasKnownArtist ||
-                cArtist.contains(normArtist) ||
-                normArtist.contains(cArtist) ||
-                normArtist.split(" ").any { token -> token.length > 2 && cArtist.contains(token) }
-            titleMatches && artistMatches
-        }?.let { return it }
-
-        if (!hasKnownArtist) {
-            candidates.firstOrNull { c ->
-                val cTitle = canonicalSongTitle(c.title).ifBlank { normalizeToken(c.title) }
-                cTitle.isNotEmpty() && (cTitle == normTitle || cTitle.contains(normTitle) || normTitle.contains(cTitle))
-            }?.let { return it }
+        val primaryArtist = extractPrimaryArtistForLyrics(targetArtist)
+        val primaryArtistTokens = lyricsArtistTokens(primaryArtist)
+        val allTargetArtistTokens = buildSet {
+            addAll(primaryArtistTokens)
+            extractAllArtistCandidatesForLyrics(targetTitle, targetArtist.ifBlank { primaryArtist })
+                .forEach { addAll(lyricsArtistTokens(it)) }
         }
 
-        return null
+        if (requireArtistMatch && allTargetArtistTokens.isEmpty()) {
+            return null
+        }
+
+        val scoredCandidates = candidates.mapNotNull { cand ->
+            val candCleanedTitle = cleanTrackTitleForLyrics(cand.title, cand.artist)
+            val cTitle = canonicalSongTitle(candCleanedTitle).ifBlank { normalizeToken(candCleanedTitle) }
+            if (cTitle.isEmpty()) return@mapNotNull null
+
+            val targetTitleWords = normTitle.split(" ").filter { it.length >= 2 }
+            val candTitleWords = cTitle.split(" ").filter { it.length >= 2 }
+
+            val exactTitleMatch = cTitle == normTitle
+            val prefixOrTokenTitleMatch = !exactTitleMatch &&
+                targetTitleWords.isNotEmpty() &&
+                targetTitleWords.all { tw -> candTitleWords.any { cw -> cw == tw } } &&
+                (cTitle.startsWith(normTitle) || normTitle.startsWith(cTitle))
+
+            if (!exactTitleMatch && !prefixOrTokenTitleMatch) {
+                return@mapNotNull null
+            }
+
+            // Duration check: reject if both durations are known (>40s) and differ by more than 20s
+            if (targetDurationMs > 40_000L && cand.durationMs > 40_000L) {
+                val diffMs = kotlin.math.abs(targetDurationMs - cand.durationMs)
+                if (diffMs > 20_000L) return@mapNotNull null
+            }
+
+            val candArtistTokens = buildSet {
+                addAll(lyricsArtistTokens(cand.artist))
+                extractAllArtistCandidatesForLyrics(cand.title, cand.artist)
+                    .forEach { addAll(lyricsArtistTokens(it)) }
+            }
+
+            if (allTargetArtistTokens.isNotEmpty()) {
+                val primaryMatches = primaryArtistTokens.isNotEmpty() && primaryArtistTokens.any { req ->
+                    candArtistTokens.any { cTok -> artistTokensMatch(req, cTok) }
+                }
+                val anyArtistMatches = allTargetArtistTokens.any { req ->
+                    candArtistTokens.any { cTok -> artistTokensMatch(req, cTok) }
+                }
+                val matchedCount = allTargetArtistTokens.count { req ->
+                    candArtistTokens.any { cTok -> artistTokensMatch(req, cTok) }
+                }
+
+                // If target specifies multiple artists (e.g. "Sumit Parta, Panjeta") or a specific artist,
+                // require strong artist overlap
+                if (!anyArtistMatches) return@mapNotNull null
+                if (!primaryMatches && matchedCount < 1) return@mapNotNull null
+
+                var matchScore = if (exactTitleMatch) 200 else 120
+                if (primaryMatches) matchScore += 120
+                matchScore += matchedCount * 60
+                if (targetDurationMs > 40_000L && cand.durationMs > 40_000L) {
+                    val diffSec = kotlin.math.abs(targetDurationMs - cand.durationMs) / 1000L
+                    if (diffSec <= 4L) matchScore += 50
+                    else if (diffSec <= 10L) matchScore += 25
+                }
+                cand to matchScore
+            } else if (!requireArtistMatch) {
+                cand to (if (exactTitleMatch) 100 else 60)
+            } else {
+                null
+            }
+        }.sortedByDescending { it.second }
+
+        return scoredCandidates.firstOrNull()?.first
     }
 
-    private suspend fun searchInnerTubeWebRemix(query: String): List<SongItem> {
+    private suspend fun searchInnerTubeWebRemix(
+        query: String,
+        countryCode: String = resolveUserCountryCode()
+    ): List<SongItem> = coroutineScope {
+        suspend fun fetchWithParams(params: String?): List<SongItem> {
+            val payload = buildJsonObject {
+                put("query", query)
+                if (params != null) {
+                    put("params", params)
+                }
+                putJsonObject("context") {
+                    putJsonObject("client") {
+                        put("clientName", "WEB_REMIX")
+                        put("clientVersion", "1.20241118.01.00")
+                        put("hl", "en")
+                        put("gl", countryCode)
+                    }
+                }
+            }
+
+            val responseText = httpPostJson(
+                url = "https://music.youtube.com/youtubei/v1/search?prettyPrint=false",
+                jsonBody = payload.toString(),
+                headers = mapOf(
+                    "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                    "Origin" to "https://music.youtube.com",
+                    "Referer" to "https://music.youtube.com/",
+                    "X-YouTube-Client-Name" to "67",
+                    "X-YouTube-Client-Version" to "1.20241118.01.00"
+                )
+            )
+
+            val rootElement = jsonParser.parseToJsonElement(responseText)
+            val renderers = mutableListOf<JsonObject>()
+            collectRenderersByKey(rootElement, "musicResponsiveListItemRenderer", renderers)
+
+            return renderers.mapNotNull { item ->
+                parseMusicResponsiveListItem(item)
+            }
+        }
+
+        // Query both Songs-filtered and Unfiltered YouTube Music (which includes Top Results & regional Music Videos)
+        val songsFilteredDef = async {
+            runCatching { fetchWithParams("EgWKAQIIAWoKEAkQBRAKEAMQBA==") }.getOrDefault(emptyList())
+        }
+        val unfilteredTopDef = async {
+            runCatching { fetchWithParams(null) }.getOrDefault(emptyList())
+        }
+
+        (unfilteredTopDef.await() + songsFilteredDef.await()).distinctBy { it.id }
+    }
+
+    /**
+     * Searches YouTube's main catalog (`youtubei/v1/search`) with `gl = IN` to capture regional Indian,
+     * Punjabi, Haryanvi, and indie music tracks (like "Katana" by Panjeta) that are distributed as official music videos.
+     */
+    private suspend fun searchYouTubeVideoCatalog(
+        query: String,
+        countryCode: String = resolveUserCountryCode()
+    ): List<SongItem> {
         val payload = buildJsonObject {
             put("query", query)
-            put("params", "EgWKAQIIAWoKEAkQBRAKEAMQBA==")
             putJsonObject("context") {
                 putJsonObject("client") {
-                    put("clientName", "WEB_REMIX")
-                    put("clientVersion", "1.20241118.01.00")
+                    put("clientName", "WEB")
+                    put("clientVersion", "2.20241118.01.00")
                     put("hl", "en")
-                    put("gl", "US")
+                    put("gl", countryCode)
                 }
             }
         }
 
         val responseText = httpPostJson(
-            url = "https://music.youtube.com/youtubei/v1/search?prettyPrint=false",
+            url = "https://www.youtube.com/youtubei/v1/search?prettyPrint=false",
             jsonBody = payload.toString(),
             headers = mapOf(
                 "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                "Origin" to "https://music.youtube.com",
-                "Referer" to "https://music.youtube.com/",
-                "X-YouTube-Client-Name" to "67",
-                "X-YouTube-Client-Version" to "1.20241118.01.00"
+                "Origin" to "https://www.youtube.com",
+                "Referer" to "https://www.youtube.com/"
             )
         )
 
         val rootElement = jsonParser.parseToJsonElement(responseText)
-        val renderers = mutableListOf<JsonObject>()
-        collectRenderersByKey(rootElement, "musicResponsiveListItemRenderer", renderers)
+        val videoRenderers = mutableListOf<JsonObject>()
+        collectRenderersByKey(rootElement, "videoRenderer", videoRenderers)
 
-        return renderers.mapNotNull { item ->
-            parseMusicResponsiveListItem(item)
+        return videoRenderers.take(15).mapNotNull { video ->
+            val videoId = video["videoId"].strOrNull() ?: return@mapNotNull null
+            val rawTitle = video["title"].objOrNull()
+                ?.get("runs").arrOrNull()
+                ?.mapNotNull { it.objOrNull()?.get("text").strOrNull() }
+                ?.joinToString("")
+                ?.trim()
+                ?: return@mapNotNull null
+
+            val durationText = video["lengthText"].objOrNull()?.get("simpleText").strOrNull()
+                ?: video["lengthText"].objOrNull()?.get("runs").arrOrNull()?.firstOrNull()?.objOrNull()?.get("text").strOrNull()
+                ?: return@mapNotNull null
+            val durationMs = parseDurationMs(durationText)
+            // Keep real song durations (60s .. 10m), skipping shorts & hour-long compilations
+            if (durationMs !in 60_000L..600_000L) return@mapNotNull null
+
+            val channelName = video["ownerText"].objOrNull()
+                ?.get("runs").arrOrNull()
+                ?.firstOrNull()?.objOrNull()
+                ?.get("text").strOrNull()
+                ?.replace(Regex("\\s*-\\s*Topic$", RegexOption.IGNORE_CASE), "")
+                ?.trim()
+                .orEmpty()
+
+            val (parsedTitle, parsedArtist) = splitVideoTitleAndArtist(rawTitle, channelName)
+            val thumbs = video["thumbnail"].objOrNull()?.get("thumbnails").arrOrNull()
+            val thumbUrl = thumbs?.lastOrNull()?.objOrNull()?.get("url").strOrNull()
+                ?: "https://i.ytimg.com/vi/$videoId/hqdefault.jpg"
+
+            SongItem(
+                id = videoId,
+                title = parsedTitle,
+                artist = parsedArtist,
+                durationMs = durationMs,
+                artworkUrl = thumbUrl,
+                streamUrl = "",
+                albumName = "Single"
+            )
         }.distinctBy { it.id }
+    }
+
+    private fun splitVideoTitleAndArtist(rawTitle: String, fallbackChannel: String): Pair<String, String> {
+        val cleaned = decodeHtmlEntities(rawTitle)
+            .replace(
+                Regex("\\s*[(\\[](?:official\\s*(?:music\\s*)?(?:video|audio|lyric\\s*video|visualizer)|full\\s*(?:video|song|audio)|lyric\\s*video|audio\\s*song|4k|hd|latest\\s*[^)\\]]*|new\\s*[^)\\]]*)[)\\]]", RegexOption.IGNORE_CASE),
+                ""
+            )
+            .trim()
+
+        val rawSegments = cleaned.split(Regex("\\s+[-–—|:]\\s+"))
+            .map { seg ->
+                seg.replace(
+                    Regex("\\b(?:official\\s*(?:music\\s*)?(?:video|audio|song)|full\\s*(?:video|song|audio)|lyric\\s*video|latest\\s*(?:haryanvi|punjabi|hindi|bhojpuri|rajasthani|indian)?\\s*songs?(?:\\s*20\\d\\d)?|new\\s*(?:haryanvi|punjabi|hindi)?\\s*songs?(?:\\s*20\\d\\d)?|4k|hd)\\b", RegexOption.IGNORE_CASE),
+                    ""
+                ).replace(Regex("\\s+"), " ").trim()
+            }
+            .filter { seg ->
+                seg.length >= 2 &&
+                    !seg.matches(Regex("(?i)^(official|full|video|audio|song|songs|20\\d\\d|hd|4k)$"))
+            }
+
+        val cleanChannel = fallbackChannel
+            .replace(Regex("\\s*-\\s*Topic$", RegexOption.IGNORE_CASE), "")
+            .trim()
+        val isGenericLabelChannel = cleanChannel.matches(
+            Regex("(?i).*(records|films|studios|entertainment|production|series|haryanvi|punjabi|t-series|zee|sony|tips|saregama|speed|white hill).*")
+        )
+
+        return if (rawSegments.size >= 2) {
+            val firstSeg = rawSegments[0]
+            val secondSeg = rawSegments[1]
+            // Detect if firstSeg is actually the artist name matching the channel (e.g. "Panjeta - Katana")
+            val firstMatchesChannel = cleanChannel.isNotBlank() &&
+                !isGenericLabelChannel &&
+                (firstSeg.equals(cleanChannel, ignoreCase = true) ||
+                    cleanChannel.contains(firstSeg, ignoreCase = true)) &&
+                !secondSeg.equals(cleanChannel, ignoreCase = true)
+
+            if (firstMatchesChannel) {
+                val songTitle = secondSeg
+                val artistsList = (listOf(firstSeg) + rawSegments.drop(2)).take(3).joinToString(", ")
+                songTitle to artistsList.ifBlank { cleanChannel.ifBlank { "Unknown Artist" } }
+            } else {
+                val songTitle = firstSeg
+                val restArtists = rawSegments.drop(1).take(3).joinToString(", ")
+                val finalArtist = if (cleanChannel.isNotBlank() &&
+                    !isGenericLabelChannel &&
+                    !restArtists.contains(cleanChannel, ignoreCase = true)
+                ) {
+                    "$restArtists, $cleanChannel"
+                } else {
+                    restArtists
+                }
+                songTitle to finalArtist.ifBlank { cleanChannel.ifBlank { "Unknown Artist" } }
+            }
+        } else {
+            val singleTitle = rawSegments.firstOrNull()?.takeIf { it.isNotBlank() } ?: cleaned
+            singleTitle to cleanChannel.ifBlank { "Unknown Artist" }
+        }
     }
 
     private fun collectRenderersByKey(
@@ -4901,7 +5442,10 @@ class MusicRepository(
             ?.get("text").objOrNull()
             ?.get("runs").arrOrNull()
 
-        val title = titleRuns?.getOrNull(0).objOrNull()?.get("text").strOrNull()
+        val rawTitle = titleRuns?.mapNotNull { it.objOrNull()?.get("text").strOrNull() }
+            ?.joinToString("")
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
             ?: return null
 
         val subtitleRuns = flexColumns.getOrNull(1).objOrNull()
@@ -4909,17 +5453,45 @@ class MusicRepository(
             ?.get("text").objOrNull()
             ?.get("runs").arrOrNull()
 
-        val textTokens = subtitleRuns?.mapNotNull { run ->
-            run.objOrNull()?.get("text").strOrNull()
-        }?.filter { it != " • " && it != "Song" && it != "Video" } ?: emptyList()
-
-        val artist = textTokens.firstOrNull() ?: "Unknown Artist"
-        val albumName = if (textTokens.size >= 2 && !textTokens[1].contains(":")) {
-            textTokens[1]
-        } else {
-            "Single"
+        // Group subtitle runs by " • " separator so multi-artist credits (e.g., "Sumit Parta & Panjeta") stay intact!
+        val groupedSegments = mutableListOf<String>()
+        val currentSegment = StringBuilder()
+        subtitleRuns?.forEach { run ->
+            val txt = run.objOrNull()?.get("text").strOrNull().orEmpty()
+            if (txt == " • ") {
+                val seg = currentSegment.toString().trim()
+                if (seg.isNotEmpty()) groupedSegments.add(seg)
+                currentSegment.clear()
+            } else {
+                currentSegment.append(txt)
+            }
         }
-        val durationToken = textTokens.lastOrNull { it.contains(":") } ?: "3:30"
+        val trailingSeg = currentSegment.toString().trim()
+        if (trailingSeg.isNotEmpty()) groupedSegments.add(trailingSeg)
+
+        val contentSegments = groupedSegments.filter {
+            !it.equals("Song", ignoreCase = true) &&
+                !it.equals("Video", ignoreCase = true) &&
+                !it.equals("Explicit", ignoreCase = true) &&
+                !it.endsWith("views", ignoreCase = true) &&
+                !it.endsWith("plays", ignoreCase = true)
+        }
+
+        val rawArtist = contentSegments.firstOrNull { !it.contains(":") } ?: "Unknown Artist"
+        val (cleanTitle, enrichedArtist) = if (rawTitle.contains(" - ") || rawTitle.contains(" | ")) {
+            val (t, a) = splitVideoTitleAndArtist(rawTitle, rawArtist)
+            val mergedArtist = if (rawArtist != "Unknown Artist" && !a.contains(rawArtist, ignoreCase = true)) {
+                "$a, $rawArtist"
+            } else {
+                a
+            }
+            t to mergedArtist
+        } else {
+            rawTitle to rawArtist
+        }
+
+        val albumName = contentSegments.drop(1).firstOrNull { !it.contains(":") } ?: "Single"
+        val durationToken = contentSegments.lastOrNull { it.contains(":") } ?: "3:30"
         val durationMs = parseDurationMs(durationToken)
 
         val thumbnails = item["thumbnail"].objOrNull()
@@ -4934,8 +5506,8 @@ class MusicRepository(
 
         return SongItem(
             id = videoId,
-            title = title,
-            artist = artist,
+            title = cleanTitle,
+            artist = enrichedArtist,
             durationMs = durationMs,
             artworkUrl = highResArtwork,
             streamUrl = "",
@@ -4964,7 +5536,7 @@ class MusicRepository(
     /**
      * Parses both Official JioSaavn API (`www.jiosaavn.com/api.php` with `encrypted_media_url`)
      * and community JioSaavn wrapper (`saavn.sumit.co` / `saavn.dev` with `downloadUrl`) into a
-     * full-length 320kbps `SongItem`.
+     * full-length 320kbps `SongItem`. Preserves primary, featured, and lyricist/composer credits (e.g. Panjeta).
      */
     private fun parseJioSaavnSongObject(obj: JsonObject?, category: String = "Trending"): SongItem? {
         if (obj == null) return null
@@ -4976,20 +5548,32 @@ class MusicRepository(
         val title = decodeHtmlEntities(rawTitle)
 
         val moreInfo = obj["more_info"].objOrNull()
+        val artistMap = moreInfo?.get("artistMap").objOrNull()
+        val artistsObj = obj["artists"].objOrNull()
 
-        val primaryArtistsFromMoreInfo = moreInfo?.get("artistMap").objOrNull()
-            ?.get("primary_artists").arrOrNull()
-            ?.mapNotNull { a -> a.objOrNull()?.get("name").strOrNull() }
-            ?.joinToString(", ")
+        val collectedArtistNames = LinkedHashSet<String>()
+        fun addArtistArray(arr: JsonArray?) {
+            arr?.forEach { elem ->
+                val name = elem.objOrNull()?.get("name").strOrNull()?.trim()
+                if (!name.isNullOrBlank()) {
+                    collectedArtistNames.add(decodeHtmlEntities(name))
+                }
+            }
+        }
 
-        val primaryArtistsFromObj = obj["artists"].objOrNull()
-            ?.get("primary").arrOrNull()
-            ?.mapNotNull { a -> a.objOrNull()?.get("name").strOrNull() }
-            ?.joinToString(", ")
+        addArtistArray(artistMap?.get("primary_artists").arrOrNull())
+        addArtistArray(artistMap?.get("featured_artists").arrOrNull())
+        addArtistArray(artistsObj?.get("primary").arrOrNull())
+        addArtistArray(artistsObj?.get("featured").arrOrNull())
+        if (collectedArtistNames.size < 3) {
+            addArtistArray(artistMap?.get("artists").arrOrNull())
+            addArtistArray(artistsObj?.get("all").arrOrNull())
+        }
+
+        val combinedMapArtists = collectedArtistNames.take(4).joinToString(", ")
 
         val artist = decodeHtmlEntities(
-            primaryArtistsFromMoreInfo?.takeIf { it.isNotBlank() }
-                ?: primaryArtistsFromObj?.takeIf { it.isNotBlank() }
+            combinedMapArtists.takeIf { it.isNotBlank() }
                 ?: moreInfo?.get("music")?.strOrNull()
                 ?: obj["primary_artists"].strOrNull()
                 ?: obj["primaryArtists"].strOrNull()
@@ -5139,10 +5723,15 @@ class MusicRepository(
         }
     }
 
-    private suspend fun searchITunesCatalog(query: String): List<SongItem> {
+    private suspend fun searchITunesCatalog(
+        query: String,
+        countryCode: String = resolveUserCountryCode(),
+        limit: Int = 25
+    ): List<SongItem> {
         val encoded = urlEncode(query)
+        val safeLimit = limit.coerceIn(5, 50)
         val responseText = httpGet(
-            "https://itunes.apple.com/search?term=$encoded&media=music&entity=song&limit=25"
+            "https://itunes.apple.com/search?term=$encoded&country=$countryCode&media=music&entity=song&limit=$safeLimit"
         )
         val root = jsonParser.parseToJsonElement(responseText).objOrNull() ?: return emptyList()
         val resultsArray = root["results"].arrOrNull() ?: return emptyList()
@@ -5178,7 +5767,7 @@ class MusicRepository(
 
     /**
      * Strictly resolves the exact song's FULL-LENGTH playable audio stream
-     * (Never returns 30-second iTunes or Deezer preview clips).
+     * (Never returns 30-second iTunes or Deezer preview clips, and NEVER substitutes an unverified song by a different artist).
      */
     suspend fun getStreamUrl(
         videoId: String,
@@ -5206,74 +5795,112 @@ class MusicRepository(
                 }
             }
 
+            val isDirectYouTubeId = videoId.isNotBlank() &&
+                !videoId.startsWith("itunes_") &&
+                !videoId.startsWith("saavn_") &&
+                !videoId.startsWith("deezer_") &&
+                !videoId.startsWith("spotify_")
+
+            // 3. CRITICAL: If videoId is ALREADY a direct YouTube videoId (e.g. "Katana" by "Panjeta" from YouTube search),
+            // extract that exact videoId's stream FIRST so we never accidentally substitute a different song from JioSaavn!
+            if (isDirectYouTubeId) {
+                val directYtUrl = tryInnerTubeDirectClients(videoId)
+                    ?: tryPipedStreamInstances(videoId)
+                if (!directYtUrl.isNullOrBlank()) {
+                    resolvedStreamCache[videoId] = directYtUrl
+                    return@runCatching directYtUrl
+                }
+            }
+
             val effectiveTitle = trackTitle.ifBlank { cachedSong?.title.orEmpty() }
             val effectiveArtist = artistName.ifBlank { cachedSong?.artist.orEmpty() }
+            val targetDurationMs = cachedSong?.durationMs ?: 0L
+
+            val cleanArtistForQuery = effectiveArtist
+                .takeIf { !it.equals("Unknown Artist", ignoreCase = true) && !it.equals("Spotify Artist", ignoreCase = true) }
+                ?.replace(",", " ")
+                ?.replace("&", " ")
+                ?.replace(Regex("\\s+"), " ")
+                ?.trim()
+                .orEmpty()
 
             val lookupQuery = buildString {
                 if (effectiveTitle.isNotBlank()) {
-                    append(effectiveTitle)
-                    if (effectiveArtist.isNotBlank() && !effectiveArtist.equals("Unknown Artist", ignoreCase = true)) {
+                    append(cleanTrackTitleForLyrics(effectiveTitle, effectiveArtist).ifBlank { effectiveTitle })
+                    if (cleanArtistForQuery.isNotBlank()) {
                         append(" ")
-                        append(effectiveArtist.split(",").first().trim())
+                        append(cleanArtistForQuery)
                     }
-                } else {
+                } else if (isDirectYouTubeId) {
                     append(fetchYouTubeOEmbedTitle(videoId).ifBlank { videoId })
                 }
             }.trim()
 
-            // 3. Search Official JioSaavn (320kbps Full-Length Stream) + YouTube Music InnerTube in parallel
+            // 4. For synthetic catalog IDs (iTunes/Deezer/Spotify) or restricted YouTube IDs, search JioSaavn + YouTube
+            // with STRICT Title + Artist verification (never falling back to unverified firstOrNull() results!).
             if (lookupQuery.isNotBlank()) {
                 val resolvedFullUrl = coroutineScope {
                     val saavnPrimaryDef = async {
-                        runCatching { searchJioSaavnCatalog(lookupQuery) }.getOrDefault(emptyList())
+                        runCatching { searchJioSaavnCatalog(lookupQuery, page = 1, limit = 20) }.getOrDefault(emptyList())
                     }
-                    val saavnTitleOnlyDef = async {
-                        if (effectiveTitle.isNotBlank() && effectiveTitle != lookupQuery) {
-                            runCatching { searchJioSaavnCatalog(effectiveTitle) }.getOrDefault(emptyList())
-                        } else {
-                            emptyList()
-                        }
-                    }
-                    val ytSearchDef = async {
+                    val ytMusicDef = async {
                         runCatching { searchInnerTubeWebRemix(lookupQuery) }.getOrDefault(emptyList())
                     }
+                    val ytVideoDef = async {
+                        runCatching { searchYouTubeVideoCatalog(lookupQuery) }.getOrDefault(emptyList())
+                    }
 
-                    val saavnCombined = (saavnPrimaryDef.await() + saavnTitleOnlyDef.await())
+                    val saavnCandidates = saavnPrimaryDef.await()
                         .filter { isFullLengthStreamUrl(it.streamUrl) }
 
-                    // A. Try strict title + artist match on JioSaavn 320kbps catalog
+                    // A. Try strict title + artist + duration match on JioSaavn 320kbps catalog
                     val matchedSaavn = if (effectiveTitle.isNotBlank()) {
-                        findBestMatchingTrack(effectiveTitle, effectiveArtist, saavnCombined)
+                        findBestMatchingTrack(
+                            targetTitle = effectiveTitle,
+                            targetArtist = effectiveArtist,
+                            candidates = saavnCandidates,
+                            targetDurationMs = targetDurationMs,
+                            requireArtistMatch = cleanArtistForQuery.isNotBlank()
+                        )
                     } else {
-                        saavnCombined.firstOrNull()
+                        null
                     }
 
                     if (matchedSaavn != null && isFullLengthStreamUrl(matchedSaavn.streamUrl)) {
                         return@coroutineScope matchedSaavn.streamUrl
                     }
 
-                    // B. Otherwise extract full-length audio stream from YouTube Music InnerTube
-                    val isSyntheticId = videoId.startsWith("itunes_") ||
-                        videoId.startsWith("saavn_") ||
-                        videoId.startsWith("deezer_") ||
-                        videoId.startsWith("spotify_")
+                    // B. Otherwise find strictly verified title + artist match on YouTube Music & YouTube Videos
+                    val ytAllResults = (ytMusicDef.await() + ytVideoDef.await()).distinctBy { it.id }
+                    val verifiedYtMatch = if (effectiveTitle.isNotBlank()) {
+                        findBestMatchingTrack(
+                            targetTitle = effectiveTitle,
+                            targetArtist = effectiveArtist,
+                            candidates = ytAllResults,
+                            targetDurationMs = targetDurationMs,
+                            requireArtistMatch = cleanArtistForQuery.isNotBlank()
+                        )
+                    } else {
+                        ytAllResults.firstOrNull()
+                    }
 
-                    val ytCandidates = buildList {
-                        if (!isSyntheticId) {
-                            add(videoId)
+                    val ytCandidateIds = buildList {
+                        if (isDirectYouTubeId) add(videoId)
+                        if (verifiedYtMatch != null) add(verifiedYtMatch.id)
+                        // Also allow any other YouTube candidate that passes strict title + artist verification
+                        ytAllResults.forEach { cand ->
+                            val verified = findBestMatchingTrack(
+                                targetTitle = effectiveTitle,
+                                targetArtist = effectiveArtist,
+                                candidates = listOf(cand),
+                                targetDurationMs = targetDurationMs,
+                                requireArtistMatch = cleanArtistForQuery.isNotBlank()
+                            )
+                            if (verified != null) add(verified.id)
                         }
-                        val ytResults = ytSearchDef.await()
-                        val bestYt = if (effectiveTitle.isNotBlank()) {
-                            findBestMatchingTrack(effectiveTitle, effectiveArtist, ytResults)
-                                ?: ytResults.firstOrNull()
-                        } else {
-                            ytResults.firstOrNull()
-                        }
-                        if (bestYt != null) add(bestYt.id)
-                        ytResults.take(2).forEach { add(it.id) }
                     }.distinct()
 
-                    for (ytId in ytCandidates) {
+                    for (ytId in ytCandidateIds.take(3)) {
                         val directYtStream = tryInnerTubeDirectClients(ytId)
                             ?: tryPipedStreamInstances(ytId)
                         if (!directYtStream.isNullOrBlank()) {
@@ -5281,8 +5908,7 @@ class MusicRepository(
                         }
                     }
 
-                    // C. Last-resort JioSaavn candidate if InnerTube was unreachable
-                    saavnCombined.firstOrNull()?.streamUrl
+                    null
                 }
 
                 if (!resolvedFullUrl.isNullOrBlank()) {
@@ -5291,39 +5917,60 @@ class MusicRepository(
                 }
             }
 
-            // 4. Direct YouTube videoId fallback if lookupQuery was empty
-            if (
-                !videoId.startsWith("itunes_") &&
-                !videoId.startsWith("saavn_") &&
-                !videoId.startsWith("deezer_") &&
-                !videoId.startsWith("spotify_")
-            ) {
-                val innerTubeUrl = tryInnerTubeDirectClients(videoId)
-                    ?: tryPipedStreamInstances(videoId)
-                if (!innerTubeUrl.isNullOrBlank()) {
-                    resolvedStreamCache[videoId] = innerTubeUrl
-                    return@runCatching innerTubeUrl
-                }
-            }
-
             throw IllegalStateException("Full-length stream unavailable for $effectiveTitle")
         }
     }
 
     suspend fun getAlternateStreamUrl(song: SongItem, failedUrl: String): String? = withContext(Dispatchers.IO) {
-        val query = "${song.title} ${song.artist}".trim()
-        val saavn = runCatching { searchJioSaavnCatalog(query) }.getOrDefault(emptyList())
+        val isDirectYouTubeId = song.id.isNotBlank() &&
+            !song.id.startsWith("itunes_") &&
+            !song.id.startsWith("saavn_") &&
+            !song.id.startsWith("deezer_") &&
+            !song.id.startsWith("spotify_")
+
+        // 1. If this is a YouTube song, first try alternate InnerTube client / Piped instance for the EXACT same videoId
+        if (isDirectYouTubeId) {
+            val altSameVideo = tryInnerTubeDirectClients(song.id, excludeUrl = failedUrl)
+                ?: tryPipedStreamInstances(song.id, excludeUrl = failedUrl)
+            if (!altSameVideo.isNullOrBlank() && altSameVideo != failedUrl) {
+                resolvedStreamCache[song.id] = altSameVideo
+                return@withContext altSameVideo
+            }
+        }
+
+        val cleanTitle = cleanTrackTitleForLyrics(song.title, song.artist).ifBlank { song.title }
+        val cleanArtist = song.artist.replace(",", " ").replace("&", " ").replace(Regex("\\s+"), " ").trim()
+        val query = "$cleanTitle $cleanArtist".trim()
+
+        // 2. Try strictly verified JioSaavn match (NEVER fall back to saavn.firstOrNull()!)
+        val saavn = runCatching { searchJioSaavnCatalog(query, page = 1, limit = 15) }.getOrDefault(emptyList())
             .filter { isFullLengthStreamUrl(it.streamUrl) && it.streamUrl != failedUrl }
-        val chosenSaavn = findBestMatchingTrack(song.title, song.artist, saavn)?.streamUrl
-            ?: saavn.firstOrNull()?.streamUrl
+        val chosenSaavn = findBestMatchingTrack(
+            targetTitle = song.title,
+            targetArtist = song.artist,
+            candidates = saavn,
+            targetDurationMs = song.durationMs,
+            requireArtistMatch = true
+        )?.streamUrl
         if (!chosenSaavn.isNullOrBlank()) {
             resolvedStreamCache[song.id] = chosenSaavn
             return@withContext chosenSaavn
         }
 
-        val ytResults = runCatching { searchInnerTubeWebRemix(query) }.getOrDefault(emptyList())
-        for (yt in ytResults.take(2)) {
-            val ytUrl = tryInnerTubeDirectClients(yt.id) ?: tryPipedStreamInstances(yt.id)
+        // 3. Try strictly verified YouTube Music / Video match
+        val ytResults = runCatching {
+            (searchInnerTubeWebRemix(query) + searchYouTubeVideoCatalog(query)).distinctBy { it.id }
+        }.getOrDefault(emptyList())
+        val verifiedYt = findBestMatchingTrack(
+            targetTitle = song.title,
+            targetArtist = song.artist,
+            candidates = ytResults,
+            targetDurationMs = song.durationMs,
+            requireArtistMatch = true
+        )
+        if (verifiedYt != null) {
+            val ytUrl = tryInnerTubeDirectClients(verifiedYt.id, excludeUrl = failedUrl)
+                ?: tryPipedStreamInstances(verifiedYt.id, excludeUrl = failedUrl)
             if (!ytUrl.isNullOrBlank() && ytUrl != failedUrl) {
                 resolvedStreamCache[song.id] = ytUrl
                 return@withContext ytUrl
@@ -5332,7 +5979,10 @@ class MusicRepository(
         null
     }
 
-    private suspend fun tryInnerTubeDirectClients(videoId: String): String? {
+    private suspend fun tryInnerTubeDirectClients(
+        videoId: String,
+        excludeUrl: String = ""
+    ): String? {
         data class InnerTubeClientSpec(
             val clientName: String,
             val clientVersion: String,
@@ -5342,8 +5992,11 @@ class MusicRepository(
             val deviceModel: String,
             val osName: String,
             val osVersion: String,
-            val androidSdkVersion: Int? = null
+            val androidSdkVersion: Int? = null,
+            val isEmbeddedTv: Boolean = false
         )
+
+        val userCountry = resolveUserCountryCode()
 
         val clients = listOf(
             InnerTubeClientSpec(
@@ -5358,15 +6011,15 @@ class MusicRepository(
                 androidSdkVersion = 32
             ),
             InnerTubeClientSpec(
-                clientName = "ANDROID_TESTSUITE",
-                clientVersion = "1.9",
-                clientIdHeader = "30",
-                userAgent = "com.google.android.youtube/1.9 (Linux; U; Android 14; Pixel 8 Pro) gzip",
-                deviceMake = "Google",
-                deviceModel = "Pixel 8 Pro",
-                osName = "Android",
-                osVersion = "14",
-                androidSdkVersion = 34
+                clientName = "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+                clientVersion = "2.0",
+                clientIdHeader = "85",
+                userAgent = "Mozilla/5.0 (PlayStation; PlayStation 5/2.26) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.0 Safari/605.1.15",
+                deviceMake = "Sony",
+                deviceModel = "PlayStation 5",
+                osName = "PlayStation",
+                osVersion = "2.26",
+                isEmbeddedTv = true
             ),
             InnerTubeClientSpec(
                 clientName = "IOS",
@@ -5377,6 +6030,17 @@ class MusicRepository(
                 deviceModel = "iPhone16,2",
                 osName = "iPhone",
                 osVersion = "18.1.0.22B83"
+            ),
+            InnerTubeClientSpec(
+                clientName = "ANDROID_TESTSUITE",
+                clientVersion = "1.9",
+                clientIdHeader = "30",
+                userAgent = "com.google.android.youtube/1.9 (Linux; U; Android 14; Pixel 8 Pro) gzip",
+                deviceMake = "Google",
+                deviceModel = "Pixel 8 Pro",
+                osName = "Android",
+                osVersion = "14",
+                androidSdkVersion = 34
             )
         )
 
@@ -5396,7 +6060,12 @@ class MusicRepository(
                             put("osVersion", spec.osVersion)
                             spec.androidSdkVersion?.let { put("androidSdkVersion", it) }
                             put("hl", "en")
-                            put("gl", "US")
+                            put("gl", userCountry)
+                        }
+                        if (spec.isEmbeddedTv) {
+                            putJsonObject("thirdParty") {
+                                put("embedUrl", "https://www.youtube.com/")
+                            }
                         }
                     }
                 }
@@ -5412,23 +6081,32 @@ class MusicRepository(
                 )
 
                 val root = jsonParser.parseToJsonElement(responseText).objOrNull() ?: return@runCatching null
-                val adaptiveFormats = root["streamingData"].objOrNull()
-                    ?.get("adaptiveFormats").arrOrNull()
+                val returnedVideoId = root["videoDetails"].objOrNull()?.get("videoId").strOrNull()
+                if (!returnedVideoId.isNullOrBlank() && returnedVideoId != videoId) {
+                    return@runCatching null
+                }
 
-                adaptiveFormats
+                val streamingData = root["streamingData"].objOrNull() ?: return@runCatching null
+                val adaptiveFormats = streamingData["adaptiveFormats"].arrOrNull()
+
+                val bestAdaptiveAudio = adaptiveFormats
                     ?.mapNotNull { it.objOrNull() }
                     ?.filter { format ->
                         val mime = format["mimeType"].strOrNull() ?: ""
-                        val url = format["url"].strOrNull()
-                        val approxMs = format["approxDurationMs"].strOrNull()?.toLongOrNull() ?: 180_000L
-                        mime.startsWith("audio/") && !url.isNullOrBlank() && approxMs > 45_000L
+                        val url = format["url"].strOrNull().orEmpty()
+                        val approxMs = format["approxDurationMs"].strOrNull()?.toLongOrNull() ?: 0L
+                        mime.startsWith("audio/") &&
+                            url.isNotBlank() &&
+                            url != excludeUrl &&
+                            (approxMs == 0L || approxMs > 30_000L)
                     }
                     ?.sortedWith(
                         compareByDescending<JsonObject> { format ->
                             val itag = format["itag"].intValOrNull() ?: 0
                             when (itag) {
-                                140 -> 2 // M4A AAC (universal hardware decoder support)
-                                251 -> 1 // WebM Opus
+                                140 -> 3 // M4A AAC (universal hardware decoder support)
+                                251 -> 2 // WebM Opus High
+                                250, 249 -> 1 // WebM Opus Med/Low
                                 else -> 0
                             }
                         }.thenByDescending { format ->
@@ -5437,6 +6115,22 @@ class MusicRepository(
                     )
                     ?.firstOrNull()
                     ?.get("url").strOrNull()
+
+                if (!bestAdaptiveAudio.isNullOrBlank()) {
+                    return@runCatching bestAdaptiveAudio
+                }
+
+                // Fallback to progressive muxed MP4 format (e.g. itag 18) which has AAC audio and plays natively in ExoPlayer
+                val muxedFormats = streamingData["formats"].arrOrNull()
+                val bestMuxedAudio = muxedFormats
+                    ?.mapNotNull { it.objOrNull() }
+                    ?.firstOrNull { format ->
+                        val url = format["url"].strOrNull().orEmpty()
+                        url.isNotBlank() && url != excludeUrl
+                    }
+                    ?.get("url").strOrNull()
+
+                bestMuxedAudio
             }.getOrNull()
 
             if (!extracted.isNullOrBlank()) {
@@ -5446,20 +6140,51 @@ class MusicRepository(
         return null
     }
 
-    private suspend fun tryPipedStreamInstances(videoId: String): String? {
-        val instances = listOf(
+    private suspend fun tryPipedStreamInstances(
+        videoId: String,
+        excludeUrl: String = ""
+    ): String? {
+        val pipedInstances = listOf(
             "https://pipedapi.kavin.rocks",
-            "https://api.piped.private.coffee"
+            "https://api.piped.private.coffee",
+            "https://pipedapi.adminforge.de",
+            "https://pipedapi.drgns.space"
         )
-        for (base in instances) {
+        for (base in pipedInstances) {
             val url = runCatching {
                 val text = httpGet("$base/streams/$videoId")
                 val root = jsonParser.parseToJsonElement(text).objOrNull() ?: return@runCatching null
                 val audioStreams = root["audioStreams"].arrOrNull()
                 audioStreams
                     ?.mapNotNull { it.objOrNull() }
-                    ?.filter { !it["url"].strOrNull().isNullOrBlank() }
+                    ?.filter {
+                        val u = it["url"].strOrNull().orEmpty()
+                        u.isNotBlank() && u != excludeUrl
+                    }
                     ?.maxByOrNull { it["bitrate"].intValOrNull() ?: 0 }
+                    ?.get("url").strOrNull()
+            }.getOrNull()
+            if (!url.isNullOrBlank()) return url
+        }
+
+        val invidiousInstances = listOf(
+            "https://inv.nadeko.net",
+            "https://invidious.nerdvpn.de",
+            "https://invidious.jing.rocks"
+        )
+        for (base in invidiousInstances) {
+            val url = runCatching {
+                val text = httpGet("$base/api/v1/videos/$videoId")
+                val root = jsonParser.parseToJsonElement(text).objOrNull() ?: return@runCatching null
+                val adaptiveFormats = root["adaptiveFormats"].arrOrNull()
+                adaptiveFormats
+                    ?.mapNotNull { it.objOrNull() }
+                    ?.filter {
+                        val type = it["type"].strOrNull().orEmpty()
+                        val u = it["url"].strOrNull().orEmpty()
+                        type.startsWith("audio/") && u.isNotBlank() && u != excludeUrl
+                    }
+                    ?.maxByOrNull { it["bitrate"].strOrNull()?.toIntOrNull() ?: 0 }
                     ?.get("url").strOrNull()
             }.getOrNull()
             if (!url.isNullOrBlank()) return url
@@ -5479,26 +6204,300 @@ class MusicRepository(
         }.getOrDefault("")
     }
 
-    internal fun cleanTrackTitleForLyrics(rawTitle: String): String {
+    internal fun cleanTrackTitleForLyrics(rawTitle: String, rawArtist: String = ""): String {
         val decoded = decodeHtmlEntities(rawTitle)
         val stripped = decoded
-            .replace(Regex("\\((?:from|official|lyric|audio|video|feat|ft|prod|remaster|version|live).*?\\)", RegexOption.IGNORE_CASE), "")
-            .replace(Regex("\\[(?:from|official|lyric|audio|video|feat|ft|prod|remaster|version|live).*?]", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("\\((?:from|official|lyric|audio|video|feat|ft|prod|remaster|version|live|full|4k|hd|new|latest).*?\\)", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("\\[(?:from|official|lyric|audio|video|feat|ft|prod|remaster|version|live|full|4k|hd|new|latest).*?]", RegexOption.IGNORE_CASE), "")
             .replace(Regex("\\(.*?\\)|\\[.*?]"), "")
-            .replace(Regex("\\s[-–|]\\s*(?:from|official|lyric|audio|video|remaster|original|soundtrack|motion picture).*$", RegexOption.IGNORE_CASE), "")
-            .replace(Regex("\\b(?:feat|ft|featuring)\\.?\\s+.*$", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("\\s[|]\\s*.*$"), "")
+            .replace(Regex("\\s[-–—]\\s*(?:from|official|lyric|lyrical|audio|video|remaster|original|soundtrack|motion picture|full|latest|new|prod).*$", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("\\b(?:feat|ft|featuring|prod\\.?(?:\\s+by)?)\\.?\\s+.*$", RegexOption.IGNORE_CASE), "")
             .replace(Regex("\\s+"), " ")
             .trim()
-        return stripped.ifBlank { decoded.trim() }
+
+        val base = stripped.ifBlank { decoded.trim() }
+        // If the title still has "Part A - Part B" where one side is the artist name (e.g. "Katana - Panjeta" or "Panjeta - Katana"),
+        // isolate the actual song title so lyrics search queries the clean song name + artist.
+        val dashParts = base.split(Regex("\\s[-–—]\\s")).map { it.trim() }.filter { it.isNotBlank() }
+        if (dashParts.size == 2 && rawArtist.isNotBlank()) {
+            val artistTokens = lyricsArtistTokens(rawArtist)
+            if (artistTokens.isNotEmpty()) {
+                val leftTokens = lyricsArtistTokens(dashParts[0])
+                val rightTokens = lyricsArtistTokens(dashParts[1])
+                val leftIsArtist = leftTokens.isNotEmpty() && leftTokens.all { l -> artistTokens.any { a -> artistTokensMatch(l, a) } }
+                val rightIsArtist = rightTokens.isNotEmpty() && rightTokens.all { r -> artistTokens.any { a -> artistTokensMatch(r, a) } }
+                if (rightIsArtist && !leftIsArtist) return dashParts[0]
+                if (leftIsArtist && !rightIsArtist) return dashParts[1]
+            }
+        }
+        return base
     }
 
     internal fun extractPrimaryArtistForLyrics(rawArtist: String): String {
         val decoded = decodeHtmlEntities(rawArtist)
+            .replace(Regex("\\s*-\\s*Topic$", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("\\bVEVO\\b", RegexOption.IGNORE_CASE), "")
+            .trim()
         val first = decoded
-            .split(Regex("[,&/]|\\b(?:feat|ft|featuring|with)\\b", RegexOption.IGNORE_CASE))
+            .split(Regex("[,&/]|\\b(?:feat|ft|featuring|with|x)\\b", RegexOption.IGNORE_CASE))
             .map { it.trim() }
-            .firstOrNull { it.isNotBlank() && !it.equals("Unknown Artist", ignoreCase = true) }
+            .firstOrNull {
+                it.isNotBlank() &&
+                    !it.equals("Unknown Artist", ignoreCase = true) &&
+                    !it.equals("Various Artists", ignoreCase = true)
+            }
         return first ?: decoded.trim()
+    }
+
+    private fun extractAllArtistCandidatesForLyrics(rawTitle: String, rawArtist: String): List<String> {
+        val decodedArtist = decodeHtmlEntities(rawArtist)
+            .replace(Regex("\\s*-\\s*Topic$", RegexOption.IGNORE_CASE), "")
+        val splitArtists = decodedArtist
+            .split(Regex("[,&/]|\\b(?:feat|ft|featuring|with|and|x)\\b", RegexOption.IGNORE_CASE))
+            .map { it.trim() }
+            .filter {
+                it.length >= 2 &&
+                    !it.equals("Unknown Artist", ignoreCase = true) &&
+                    !it.equals("Various Artists", ignoreCase = true)
+            }
+
+        val decodedTitle = decodeHtmlEntities(rawTitle)
+        val featMatch = Regex("\\b(?:feat|ft|featuring)\\.?\\s+([^)\\]|\\-–]+)", RegexOption.IGNORE_CASE)
+            .find(decodedTitle)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.trim()
+            .orEmpty()
+        val dashParts = decodedTitle
+            .replace(Regex("\\(.*?\\)|\\[.*?]"), "")
+            .split(Regex("\\s[-–—|]\\s"))
+            .map { it.trim() }
+            .filter { it.length in 2..36 }
+
+        return buildList {
+            addAll(splitArtists)
+            if (featMatch.isNotBlank()) add(featMatch)
+            if (dashParts.size >= 2) {
+                add(dashParts[1])
+            }
+        }.distinctBy { it.lowercase() }
+    }
+
+    private fun lyricsArtistTokens(rawText: String): Set<String> {
+        val stopWords = setOf(
+            "unknown", "artist", "various", "artists", "official", "music", "the", "and",
+            "feat", "ft", "featuring", "with", "prod", "by", "records", "entertainment",
+            "studio", "studios", "topic", "vevo", "audio", "video", "song", "songs",
+            "new", "latest", "full", "lyrical", "lyrics", "original", "soundtrack", "from"
+        )
+        return decodeHtmlEntities(rawText)
+            .lowercase()
+            .replace("$", "s")
+            .replace(Regex("[^a-z0-9\\s]"), " ")
+            .split(Regex("\\s+"))
+            .map { it.trim() }
+            .filter { it.length >= 2 && it !in stopWords }
+            .toSet()
+    }
+
+    private fun phoneticArtistStem(token: String): String {
+        val lower = token.lowercase().trim()
+        if (lower.length <= 3) return lower
+        val mapped = lower
+            .replace("ph", "f")
+            .replace("th", "t")
+            .replace("dh", "d")
+            .replace("bh", "b")
+            .replace("kh", "k")
+            .replace("gh", "g")
+            .replace("sh", "s")
+            .replace("chh", "ch")
+            .replace("aa", "a")
+            .replace("ee", "i")
+            .replace("oo", "u")
+            .replace("ou", "u")
+        val sb = StringBuilder(mapped.length)
+        for (ch in mapped) {
+            if (sb.isEmpty() || sb.last() != ch) {
+                sb.append(ch)
+            }
+        }
+        return sb.toString()
+    }
+
+    private fun isEditDistanceAtMostOne(a: String, b: String): Boolean {
+        val lenDiff = kotlin.math.abs(a.length - b.length)
+        if (lenDiff > 1) return false
+        var i = 0
+        var j = 0
+        var edits = 0
+        while (i < a.length && j < b.length) {
+            if (a[i] == b[j]) {
+                i++
+                j++
+            } else {
+                edits++
+                if (edits > 1) return false
+                if (a.length > b.length) {
+                    i++
+                } else if (b.length > a.length) {
+                    j++
+                } else {
+                    i++
+                    j++
+                }
+            }
+        }
+        if (i < a.length || j < b.length) edits++
+        return edits <= 1
+    }
+
+    private fun artistTokensMatch(tokenA: String, tokenB: String): Boolean {
+        if (tokenA == tokenB) return true
+        if (tokenA.length >= 4 && tokenB.length >= 4) {
+            val stemA = phoneticArtistStem(tokenA)
+            val stemB = phoneticArtistStem(tokenB)
+            if (stemA == stemB && stemA.length >= 3) return true
+            if (tokenA.length >= 5 && tokenB.length >= 5 && isEditDistanceAtMostOne(tokenA, tokenB)) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun anyArtistTokenMatches(targetTokens: Set<String>, candidateTokens: Set<String>): Boolean {
+        if (targetTokens.isEmpty() || candidateTokens.isEmpty()) return false
+        if (targetTokens.any { t -> candidateTokens.any { c -> artistTokensMatch(t, c) } }) {
+            return true
+        }
+        // Also check compound single-word vs two-word artist spellings (e.g. "moosewala" vs "moose wala")
+        val candidateJoined = candidateTokens.joinToString("")
+        val targetJoined = targetTokens.joinToString("")
+        return targetTokens.any { t -> t.length >= 5 && candidateJoined.contains(t) } ||
+            candidateTokens.any { c -> c.length >= 5 && targetJoined.contains(c) }
+    }
+
+    /**
+     * Strictly verifies and scores a lyrics candidate against both the song title and artist.
+     * Returns `null` if the title does not match OR if the target track has a known artist that
+     * does not match the candidate's artist, track name, or album credits.
+     */
+    private fun scoreAndVerifyLyricsCandidate(
+        targetCleanTitle: String,
+        primaryArtistTokens: Set<String>,
+        allTargetArtistTokens: Set<String>,
+        candidateTitle: String,
+        candidateArtist: String,
+        candidateAlbum: String = "",
+        targetDurationSec: Long = 0L,
+        candidateDurationSec: Long? = null,
+        hasSynced: Boolean = false
+    ): Int? {
+        val targetCanonTitle = canonicalSongTitle(targetCleanTitle)
+        if (targetCanonTitle.isEmpty()) return null
+
+        val rawCandCanonTitle = canonicalSongTitle(candidateTitle)
+        if (rawCandCanonTitle.isEmpty()) return null
+
+        // Strip target artist tokens if candidateTitle embedded the artist (e.g. "Katana - Panjeta")
+        val targetWords = targetCanonTitle.split(" ").filter { it.isNotBlank() }
+        val candWords = rawCandCanonTitle.split(" ").filter { it.isNotBlank() }
+        val candWordsWithoutArtist = candWords.filter { w ->
+            !allTargetArtistTokens.any { a -> artistTokensMatch(w, a) }
+        }
+        val strippedCandCanonTitle = candWordsWithoutArtist.joinToString(" ").trim()
+            .ifEmpty { rawCandCanonTitle }
+
+        val allowedVersionWords = setOf(
+            "remix", "slowed", "reverb", "lofi", "lo", "fi", "unplugged", "acoustic",
+            "version", "edit", "live", "reprise", "ost", "original", "mix", "radio",
+            "extended", "instrumental", "bonus", "track", "single", "song", "haryanvi",
+            "punjabi", "hindi", "english", "translation", "romanized", "romanised"
+        )
+
+        val exactTitleMatch = rawCandCanonTitle == targetCanonTitle ||
+            strippedCandCanonTitle == targetCanonTitle
+
+        val wordBoundaryTitleContainment = if (!exactTitleMatch) {
+            val candSet = candWords.toSet()
+            val targetSet = targetWords.toSet()
+            when {
+                targetSet.all { it in candSet } -> {
+                    val extraWords = candSet - targetSet
+                    extraWords.all { extra ->
+                        extra in allowedVersionWords ||
+                            allTargetArtistTokens.any { a -> artistTokensMatch(extra, a) }
+                    }
+                }
+                targetSet.size >= 2 && candSet.size >= 2 && candSet.all { it in targetSet } -> true
+                else -> false
+            }
+        } else {
+            true
+        }
+
+        if (!exactTitleMatch && !wordBoundaryTitleContainment) return null
+
+        // Mandatory Artist Verification when target artist is known
+        val candArtistTokens = lyricsArtistTokens(candidateArtist)
+        val candTitleAndAlbumTokens = lyricsArtistTokens("$candidateTitle $candidateAlbum")
+
+        val hasPrimaryArtistMatch = anyArtistTokenMatches(primaryArtistTokens, candArtistTokens)
+        val hasCoArtistMatch = !hasPrimaryArtistMatch &&
+            anyArtistTokenMatches(allTargetArtistTokens, candArtistTokens)
+        val hasContextArtistMatch = !hasPrimaryArtistMatch && !hasCoArtistMatch &&
+            anyArtistTokenMatches(allTargetArtistTokens, candTitleAndAlbumTokens)
+
+        if (allTargetArtistTokens.isNotEmpty() &&
+            !hasPrimaryArtistMatch &&
+            !hasCoArtistMatch &&
+            !hasContextArtistMatch
+        ) {
+            // Reject candidates from unrelated artists that happen to share the same song title
+            return null
+        }
+
+        var score = 0
+        score += if (exactTitleMatch) 150 else 85
+
+        when {
+            hasPrimaryArtistMatch -> {
+                score += 240
+                if (primaryArtistTokens.size > 1 &&
+                    primaryArtistTokens.all { p -> candArtistTokens.any { c -> artistTokensMatch(p, c) } }
+                ) {
+                    score += 50
+                }
+            }
+            hasCoArtistMatch -> score += 170
+            hasContextArtistMatch -> score += 130
+        }
+
+        if (hasSynced) score += 210
+
+        // Penalize slowed/remix/lofi lyrics if the user is playing the standard original version
+        val targetLower = targetCleanTitle.lowercase()
+        val candLower = "$candidateTitle $candidateAlbum".lowercase()
+        for (modTag in listOf("slowed", "remix", "lofi", "lo-fi", "8d", "nightcore", "mashup")) {
+            if (candLower.contains(modTag) && !targetLower.contains(modTag)) {
+                score -= 90
+            }
+        }
+
+        if (targetDurationSec > 0L && candidateDurationSec != null && candidateDurationSec > 0L) {
+            val diffSec = kotlin.math.abs(candidateDurationSec - targetDurationSec)
+            score += when {
+                diffSec <= 2L -> 160
+                diffSec <= 5L -> 115
+                diffSec <= 10L -> 55
+                diffSec <= 18L -> 10
+                diffSec <= 30L -> -40
+                else -> -160
+            }
+        }
+
+        return score
     }
 
     private fun parsePlainLyricsLines(rawPlain: String): List<LyricLine> {
@@ -5510,7 +6509,11 @@ class MusicRepository(
         )
         return cleanedText.lines()
             .map { it.trim() }
-            .filter { it.isNotEmpty() && !it.startsWith("Paroles de la chanson", ignoreCase = true) }
+            .filter {
+                it.isNotEmpty() &&
+                    !it.startsWith("Paroles de la chanson", ignoreCase = true) &&
+                    !it.startsWith("Lyricslicensed", ignoreCase = true)
+            }
             .map { line -> LyricLine(startTimeMs = 0L, text = line) }
     }
 
@@ -5533,10 +6536,41 @@ class MusicRepository(
         return null
     }
 
+    private val hinglishVocabularyTokens = setOf(
+        "hai", "hain", "mein", "main", "tera", "teri", "tere", "mera", "meri", "mere",
+        "tujhe", "tujhko", "mujhe", "mujhko", "dil", "pyar", "pyaar", "ishq", "mohabbat",
+        "zindagi", "duniya", "raat", "shaam", "subah", "aankh", "aankhein", "ankhiyan",
+        "baat", "baatein", "yaad", "yaadein", "saath", "kabhi", "kuch", "koi", "kya",
+        "kyun", "kahan", "kaise", "jab", "tab", "abhi", "yahan", "wahan", "nahi", "nahin",
+        "naa", "haan", "achha", "acha", "sachi", "sach", "jhooth", "sapna", "sapne",
+        "apna", "apne", "apni", "tum", "tumhe", "tumhara", "hum", "humein", "humara",
+        "jaana", "jaane", "aana", "aaja", "chhod", "chod", "dekh", "dekha", "dekho",
+        "sun", "suna", "suno", "karde", "karna", "kiya", "ho", "hoga", "hota", "hoti",
+        "jatt", "munda", "munde", "kudi", "kudiyan", "gabru", "yaar", "yaaran", "beli",
+        "vailly", "asla", "bandook", "gaddi", "pind", "shehar", "chora", "chori", "haryanvi",
+        "tau", "bhole", "bam", "kamar", "ghagra", "nakhra", "nakhre", "patola", "sohneya",
+        "makhna", "mahिया", "mahiya", "rab", "rabba", "khuda", "maula", "sajna", "sajni",
+        "piya", "o", "ve", "ni", "ke", "ka", "ki", "ko", "se", "pe", "par", "bhi", "toh"
+    )
+
+    private val commonEnglishTokens = setOf(
+        "the", "and", "you", "that", "was", "for", "are", "with", "his", "they", "have",
+        "this", "from", "what", "when", "where", "your", "all", "can", "Said", "there",
+        "each", "which", "she", "how", "their", "will", "other", "about", "out", "many",
+        "then", "them", "these", "some", "her", "would", "make", "like", "him", "into",
+        "time", "has", "look", "two", "more", "write", "see", "number", "way", "could",
+        "people", "than", "first", "water", "been", "call", "who", "oil", "its", "now",
+        "find", "long", "down", "day", "did", "get", "come", "made", "may", "part",
+        "love", "heart", "night", "baby", "never", "ever", "know", "feel", "want", "need",
+        "take", "away", "stay", "life", "world", "eyes", "mind", "soul", "girl", "boy"
+    )
+
     private fun detectLyricsScriptLabel(lines: List<LyricLine>, candidateTitle: String = ""): String {
-        val sample = lines.take(24).joinToString(" ") { it.text }
+        val sample = lines.take(28).joinToString(" ") { it.text }
         var devanagari = 0
         var gurmukhi = 0
+        var bengali = 0
+        var gujarati = 0
         var tamil = 0
         var telugu = 0
         var hangul = 0
@@ -5547,6 +6581,8 @@ class MusicRepository(
             when (ch.code) {
                 in 0x0900..0x097F -> devanagari++
                 in 0x0A00..0x0A7F -> gurmukhi++
+                in 0x0980..0x09FF -> bengali++
+                in 0x0A80..0x0AFF -> gujarati++
                 in 0x0B80..0x0BFF -> tamil++
                 in 0x0C00..0x0C7F -> telugu++
                 in 0xAC00..0xD7AF, in 0x1100..0x11FF -> hangul++
@@ -5557,42 +6593,374 @@ class MusicRepository(
         }
         val lowerTitle = candidateTitle.lowercase()
         return when {
-            lowerTitle.contains("english translation") || lowerTitle.contains("(english") -> "English"
-            lowerTitle.contains("romanized") || lowerTitle.contains("romanised") -> "Romanized"
-            devanagari > 12 -> "Hindi (Devanagari)"
-            gurmukhi > 12 -> "Punjabi"
-            tamil > 12 -> "Tamil"
-            telugu > 12 -> "Telugu"
-            hangul > 10 -> "Korean"
-            japanese > 8 -> "Japanese / CJK"
-            arabic > 10 -> "Arabic / Urdu"
-            latin > 12 -> "Latin / English"
+            lowerTitle.contains("romanized") || lowerTitle.contains("romanised") || lowerTitle.contains("hinglish") ->
+                "Romanized (Hinglish)"
+            lowerTitle.contains("english translation") || lowerTitle.contains("(english") ->
+                "English"
+            devanagari > 10 -> "Original (Hindi)"
+            gurmukhi > 10 -> "Original (Punjabi)"
+            bengali > 10 -> "Original (Bengali)"
+            gujarati > 10 -> "Original (Gujarati)"
+            tamil > 10 -> "Original (Tamil)"
+            telugu > 10 -> "Original (Telugu)"
+            hangul > 10 -> "Original (Korean)"
+            japanese > 8 -> "Original (Japanese)"
+            arabic > 10 -> "Original (Urdu)"
+            latin > 12 -> {
+                val words = sample.lowercase()
+                    .replace(Regex("[^a-z\\s]"), " ")
+                    .split(Regex("\\s+"))
+                    .filter { it.length >= 2 }
+                val hinglishCount = words.count { it in hinglishVocabularyTokens }
+                val englishCount = words.count { it in commonEnglishTokens }
+                if (hinglishCount >= 3 && hinglishCount * 2 >= englishCount) {
+                    "Romanized (Hinglish)"
+                } else {
+                    "English"
+                }
+            }
             else -> "Original"
         }
     }
 
+    internal fun lyricsLanguagePriority(label: String): Int {
+        val lower = label.lowercase()
+        return when {
+            lower.contains("romanized") || lower.contains("hinglish") -> 0
+            lower == "english" || lower.contains("english") -> 1
+            else -> 2
+        }
+    }
+
+    private fun containsIndicScript(lines: List<LyricLine>): Boolean {
+        val sample = lines.take(24).joinToString(" ") { it.text }
+        return sample.any { ch ->
+            ch.code in 0x0900..0x0D7F
+        }
+    }
+
+    /**
+     * Converts Indic script lyrics (Devanagari Hindi/Haryanvi, Gurmukhi Punjabi, Bengali, Gujarati)
+     * into natural Romanized (Hinglish) with word-final schwa deletion while preserving timestamps.
+     */
+    internal fun transliterateIndicLineToRomanizedHinglish(text: String): String {
+        var hasIndic = false
+        for (c in text) {
+            if (c.code in 0x0900..0x0AFF) {
+                hasIndic = true
+                break
+            }
+        }
+        if (!hasIndic) return text
+
+        fun isIndicConsonant(offset: Int): Boolean {
+            return offset in 0x15..0x39 || offset in 0x58..0x5F || offset == 0x79 || offset == 0x7A || offset == 0x7B || offset == 0x7E
+        }
+
+        fun isIndicMatraOrVirama(offset: Int): Boolean {
+            return offset in 0x3E..0x4D || offset in 0x62..0x63 || offset == 0x3C || offset == 0x70 || offset == 0x71
+        }
+
+        fun consonantSound(offset: Int, nukta: Boolean): String = when (offset) {
+            0x15 -> if (nukta) "q" else "k"
+            0x16 -> if (nukta) "kh" else "kh"
+            0x17 -> if (nukta) "gh" else "g"
+            0x18 -> "gh"
+            0x19 -> "ng"
+            0x1A -> "ch"
+            0x1B -> "chh"
+            0x1C -> if (nukta) "z" else "j"
+            0x1D -> "jh"
+            0x1E -> "ny"
+            0x1F -> "t"
+            0x20 -> "th"
+            0x21 -> if (nukta) "r" else "d"
+            0x22 -> if (nukta) "rh" else "dh"
+            0x23 -> "n"
+            0x24 -> "t"
+            0x25 -> "th"
+            0x26 -> "d"
+            0x27 -> "dh"
+            0x28 -> "n"
+            0x29 -> "n"
+            0x2A -> "p"
+            0x2B -> if (nukta) "f" else "ph"
+            0x2C -> "b"
+            0x2D -> "bh"
+            0x2E -> "m"
+            0x2F -> "y"
+            0x30 -> "r"
+            0x31 -> "r"
+            0x32 -> "l"
+            0x33 -> if (nukta) "sh" else "l"
+            0x34 -> "l"
+            0x35 -> "v"
+            0x36 -> "sh"
+            0x37 -> "sh"
+            0x38 -> "s"
+            0x39 -> "h"
+            0x58 -> "q"
+            0x59 -> "kh"
+            0x5A -> "gh"
+            0x5B -> "z"
+            0x5C -> "r"
+            0x5D -> "rh"
+            0x5E -> "f"
+            0x5F -> "y"
+            0x79 -> "z"
+            0x7A -> "y"
+            0x7B -> "g"
+            0x7E -> "d"
+            else -> ""
+        }
+
+        fun independentVowelSound(offset: Int): String = when (offset) {
+            0x04, 0x05 -> "a"
+            0x06 -> "aa"
+            0x07 -> "i"
+            0x08 -> "ee"
+            0x09 -> "u"
+            0x0A -> "oo"
+            0x0B -> "ri"
+            0x0D, 0x0E, 0x0F -> "e"
+            0x10 -> "ai"
+            0x11, 0x12, 0x13 -> "o"
+            0x14 -> "au"
+            else -> ""
+        }
+
+        fun matraSound(offset: Int): String = when (offset) {
+            0x3E -> "a"
+            0x3F -> "i"
+            0x40 -> "ee"
+            0x41 -> "u"
+            0x42 -> "oo"
+            0x43, 0x44 -> "ri"
+            0x45, 0x46, 0x47 -> "e"
+            0x48 -> "ai"
+            0x49, 0x4A, 0x4B -> "o"
+            0x4C -> "au"
+            else -> ""
+        }
+
+        val sb = StringBuilder()
+        var i = 0
+        val n = text.length
+        while (i < n) {
+            val ch = text[i]
+            val code = ch.code
+            val blockBase = when (code) {
+                in 0x0900..0x097F -> 0x0900 // Devanagari
+                in 0x0980..0x09FF -> 0x0980 // Bengali
+                in 0x0A00..0x0A7F -> 0x0A00 // Gurmukhi
+                in 0x0A80..0x0AFF -> 0x0A80 // Gujarati
+                else -> -1
+            }
+
+            if (blockBase == -1) {
+                sb.append(ch)
+                i++
+                continue
+            }
+
+            val offset = code - blockBase
+            // Gurmukhi Adhak (0x71) doubles the next consonant, Tippi (0x70) nasalizes
+            if (offset == 0x70 || offset == 0x01 || offset == 0x02) {
+                sb.append("n")
+                i++
+                continue
+            }
+            if (offset == 0x03) {
+                sb.append("h")
+                i++
+                continue
+            }
+            if (offset == 0x71 || offset == 0x3C || offset == 0x4D) {
+                i++
+                continue
+            }
+            if (offset in 0x66..0x6F) {
+                sb.append(('0'.code + (offset - 0x66)).toChar())
+                i++
+                continue
+            }
+            if (offset == 0x64 || offset == 0x65) {
+                sb.append(" ")
+                i++
+                continue
+            }
+
+            if (offset in 0x04..0x14) {
+                sb.append(independentVowelSound(offset))
+                i++
+                continue
+            }
+
+            if (isIndicConsonant(offset)) {
+                var nextIdx = i + 1
+                var hasNukta = false
+                if (nextIdx < n && (text[nextIdx].code - blockBase) == 0x3C) {
+                    hasNukta = true
+                    nextIdx++
+                }
+                // Skip Gurmukhi Adhak if attached after consonant
+                if (nextIdx < n && (text[nextIdx].code - blockBase) == 0x71) {
+                    nextIdx++
+                }
+
+                val cSound = consonantSound(offset, hasNukta)
+                sb.append(cSound)
+
+                val nextOffset = if (nextIdx < n && (text[nextIdx].code - blockBase) in 0x00..0x7F) {
+                    text[nextIdx].code - blockBase
+                } else {
+                    -1
+                }
+
+                when {
+                    nextOffset == 0x4D -> {
+                        // Virama / Halant suppresses inherent vowel
+                        i = nextIdx + 1
+                    }
+                    nextOffset in 0x3E..0x4C -> {
+                        sb.append(matraSound(nextOffset))
+                        i = nextIdx + 1
+                    }
+                    else -> {
+                        // Inherent 'a' vowel: keep inside word, drop at word-end (natural Hindi/Punjabi schwa deletion)
+                        val isWordEnd = nextIdx >= n ||
+                            text[nextIdx].isWhitespace() ||
+                            (text[nextIdx].code - blockBase) !in 0x00..0x7F ||
+                            (text[nextIdx].code - blockBase) in 0x64..0x65
+                        val isSingleLetterWord = (i == 0 || text[i - 1].isWhitespace()) && isWordEnd
+                        if (!isWordEnd || isSingleLetterWord) {
+                            sb.append("a")
+                        }
+                        i = nextIdx
+                    }
+                }
+                continue
+            }
+
+            if (offset in 0x3E..0x4C) {
+                sb.append(matraSound(offset))
+                i++
+                continue
+            }
+
+            i++
+        }
+
+        return sb.toString()
+            .replace(Regex("\\s+"), " ")
+            .trim()
+            .replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
+    }
+
+    /**
+     * Enforces user-requested Lyrics Language Priority:
+     * 1st: Romanized (Hinglish)
+     * 2nd: English (if Romanized is not available)
+     * 3rd: Original (if neither Romanized nor English is available)
+     * Also automatically generates a Romanized (Hinglish) variant when Indic-script lyrics are returned.
+     */
+    private fun prioritizeLyricsVariants(
+        primary: LyricsData,
+        extraVariants: List<LyricsVariant> = emptyList()
+    ): LyricsData {
+        if (primary.lines.isEmpty()) return primary
+
+        val allVariants = mutableListOf<LyricsVariant>()
+        allVariants.add(
+            LyricsVariant(
+                languageLabel = primary.languageLabel.ifBlank { detectLyricsScriptLabel(primary.lines) },
+                lines = primary.lines,
+                isSynced = primary.isSynced
+            )
+        )
+        primary.alternateVariants.forEach { v ->
+            if (v.lines.isNotEmpty()) allVariants.add(v)
+        }
+        extraVariants.forEach { v ->
+            if (v.lines.isNotEmpty()) allVariants.add(v)
+        }
+
+        // If any variant is in an Indic script (Hindi/Punjabi/etc.) and no Romanized (Hinglish) variant exists yet,
+        // generate a timestamp-synced Romanized (Hinglish) variant automatically!
+        val hasRomanized = allVariants.any { lyricsLanguagePriority(it.languageLabel) == 0 }
+        if (!hasRomanized) {
+            val indicSource = allVariants
+                .sortedByDescending { it.isSynced }
+                .firstOrNull { containsIndicScript(it.lines) }
+            if (indicSource != null) {
+                val romanizedLines = indicSource.lines.map { line ->
+                    line.copy(text = transliterateIndicLineToRomanizedHinglish(line.text))
+                }
+                allVariants.add(
+                    0,
+                    LyricsVariant(
+                        languageLabel = "Romanized (Hinglish)",
+                        lines = romanizedLines,
+                        isSynced = indicSource.isSynced
+                    )
+                )
+            }
+        }
+
+        // Deduplicate by language label (preferring synced variants when two have the same label)
+        val deduplicated = allVariants
+            .sortedWith(
+                compareBy<LyricsVariant> { lyricsLanguagePriority(it.languageLabel) }
+                    .thenByDescending { it.isSynced }
+            )
+            .distinctBy { it.languageLabel.lowercase() }
+
+        val bestDefault = deduplicated.first()
+        val remainingAlternates = deduplicated.drop(1)
+
+        return LyricsData(
+            lines = bestDefault.lines,
+            isSynced = bestDefault.isSynced,
+            languageLabel = bestDefault.languageLabel,
+            alternateVariants = remainingAlternates
+        )
+    }
+
     private suspend fun searchLrclibCatalogWithVariants(
+        rawTitle: String,
         cleanTitle: String,
         primaryArtist: String,
         fullArtist: String,
         durationSec: Long
     ): Pair<LyricsData?, List<LyricsVariant>> {
-        val queries = buildList {
+        val artistCandidates = extractAllArtistCandidatesForLyrics(rawTitle, fullArtist.ifBlank { primaryArtist })
+        val primaryArtistTokens = lyricsArtistTokens(primaryArtist)
+        val allTargetArtistTokens = buildSet {
+            addAll(primaryArtistTokens)
+            artistCandidates.forEach { addAll(lyricsArtistTokens(it)) }
+        }
+
+        val searchUrls = buildList {
             if (cleanTitle.isNotBlank() && primaryArtist.isNotBlank()) {
-                add("$cleanTitle $primaryArtist")
+                add("https://lrclib.net/api/search?track_name=${urlEncode(cleanTitle)}&artist_name=${urlEncode(primaryArtist)}")
+                add("https://lrclib.net/api/search?q=${urlEncode("$cleanTitle $primaryArtist")}")
+                add("https://lrclib.net/api/search?q=${urlEncode("$cleanTitle $primaryArtist romanized")}")
             }
+            for (altArtist in artistCandidates.drop(1).take(2)) {
+                if (cleanTitle.isNotBlank() && altArtist.isNotBlank() && !altArtist.equals(primaryArtist, ignoreCase = true)) {
+                    add("https://lrclib.net/api/search?q=${urlEncode("$cleanTitle $altArtist")}")
+                }
+            }
+            // Fallback track_name query (still strictly gated by scoreAndVerifyLyricsCandidate artist verification!)
             if (cleanTitle.isNotBlank()) {
-                add(cleanTitle)
+                add("https://lrclib.net/api/search?track_name=${urlEncode(cleanTitle)}")
             }
         }.distinct()
 
-        val targetCanonTitle = canonicalSongTitle(cleanTitle)
-        val targetArtistWords = artistWordSet(fullArtist.ifBlank { primaryArtist })
         val collectedParsed = mutableListOf<Pair<Int, LyricsData>>()
 
-        for (q in queries) {
+        for (url in searchUrls) {
             runCatching {
-                val url = "https://lrclib.net/api/search?q=${urlEncode(q)}"
                 val text = httpGet(url)
                 val arr = jsonParser.parseToJsonElement(text).arrOrNull() ?: return@runCatching
                 val candidates = arr.mapNotNull { it.objOrNull() }
@@ -5601,36 +6969,25 @@ class MusicRepository(
                 val scored = candidates.mapNotNull { item ->
                     val itemTitle = item["trackName"].strOrNull() ?: item["name"].strOrNull() ?: return@mapNotNull null
                     val itemArtist = item["artistName"].strOrNull().orEmpty()
-                    val itemCanonTitle = canonicalSongTitle(itemTitle)
-                    val titleMatches = itemCanonTitle == targetCanonTitle ||
-                        itemCanonTitle.contains(targetCanonTitle) ||
-                        targetCanonTitle.contains(itemCanonTitle)
-                    if (!titleMatches) return@mapNotNull null
-
-                    val itemArtistWords = artistWordSet(itemArtist)
-                    val artistOverlap = targetArtistWords.any { it in itemArtistWords }
+                    val itemAlbum = item["albumName"].strOrNull().orEmpty()
                     val hasSynced = !item["syncedLyrics"].strOrNull().isNullOrBlank()
                     val hasPlain = !item["plainLyrics"].strOrNull().isNullOrBlank()
                     if (!hasSynced && !hasPlain) return@mapNotNull null
 
-                    var score = 0
-                    if (itemCanonTitle == targetCanonTitle) score += 100 else score += 50
-                    if (artistOverlap) score += 80
-                    if (hasSynced) score += 220
-
-                    // Weight duration proximity heavily so radio edits / slowed versions don't desync
                     val itemDurationSec = item["duration"].longValOrNull()
                         ?: item["duration"].strOrNull()?.toDoubleOrNull()?.toLong()
-                    if (durationSec > 0L && itemDurationSec != null && itemDurationSec > 0L) {
-                        val diffSec = kotlin.math.abs(itemDurationSec - durationSec)
-                        score += when {
-                            diffSec <= 2L -> 160
-                            diffSec <= 5L -> 110
-                            diffSec <= 10L -> 50
-                            diffSec <= 18L -> 0
-                            else -> -150
-                        }
-                    }
+
+                    val score = scoreAndVerifyLyricsCandidate(
+                        targetCleanTitle = cleanTitle,
+                        primaryArtistTokens = primaryArtistTokens,
+                        allTargetArtistTokens = allTargetArtistTokens,
+                        candidateTitle = itemTitle,
+                        candidateArtist = itemArtist,
+                        candidateAlbum = itemAlbum,
+                        targetDurationSec = durationSec,
+                        candidateDurationSec = itemDurationSec,
+                        hasSynced = hasSynced
+                    ) ?: return@mapNotNull null
 
                     Triple(item, itemTitle, score)
                 }.sortedByDescending { it.third }
@@ -5638,15 +6995,23 @@ class MusicRepository(
                 for ((bestObj, itemTitle, score) in scored.take(6)) {
                     parseLrclibObjectToLyricsData(bestObj)?.let { parsed ->
                         val label = detectLyricsScriptLabel(parsed.lines, itemTitle)
-                        collectedParsed.add(score to parsed.copy(languageLabel = label))
+                        val langBonus = when (lyricsLanguagePriority(label)) {
+                            0 -> 45 // Prefer Romanized (Hinglish)
+                            1 -> 25 // Prefer English next
+                            else -> 0
+                        }
+                        collectedParsed.add((score + langBonus) to parsed.copy(languageLabel = label))
                     }
                 }
             }
-            if (collectedParsed.isNotEmpty()) break
+            if (collectedParsed.any { it.second.isSynced && lyricsLanguagePriority(it.second.languageLabel) == 0 }) break
         }
 
         if (collectedParsed.isEmpty()) return null to emptyList()
-        val sortedByBestScore = collectedParsed.sortedByDescending { it.first }
+        val sortedByBestScore = collectedParsed.sortedWith(
+            compareBy<Pair<Int, LyricsData>> { lyricsLanguagePriority(it.second.languageLabel) }
+                .thenByDescending { it.first }
+        )
         val primary = sortedByBestScore.first().second
         val distinctVariants = sortedByBestScore
             .drop(1)
@@ -5665,27 +7030,66 @@ class MusicRepository(
 
     private suspend fun fetchJioSaavnLyrics(
         songId: String,
+        rawTitle: String,
         cleanTitle: String,
-        primaryArtist: String
+        primaryArtist: String,
+        fullArtist: String,
+        durationSec: Long
     ): LyricsData? {
+        val primaryArtistTokens = lyricsArtistTokens(primaryArtist)
+        val allTargetArtistTokens = buildSet {
+            addAll(primaryArtistTokens)
+            extractAllArtistCandidatesForLyrics(rawTitle, fullArtist.ifBlank { primaryArtist })
+                .forEach { addAll(lyricsArtistTokens(it)) }
+        }
+
         val candidateSaavnIds = mutableListOf<String>()
         if (songId.startsWith("saavn_")) {
-            candidateSaavnIds.add(songId.removePrefix("saavn_").trim())
+            val directId = songId.removePrefix("saavn_").trim()
+            if (directId.isNotBlank()) candidateSaavnIds.add(directId)
         }
-        if (candidateSaavnIds.isEmpty() && cleanTitle.isNotBlank()) {
-            val searched = runCatching {
-                searchJioSaavnCatalog("$cleanTitle $primaryArtist".trim())
-            }.getOrDefault(emptyList())
-            searched.firstOrNull()?.id?.removePrefix("saavn_")?.takeIf { it.isNotBlank() }?.let {
-                candidateSaavnIds.add(it)
+
+        if (cleanTitle.isNotBlank()) {
+            val searchQueries = buildList {
+                if (primaryArtist.isNotBlank()) add("$cleanTitle $primaryArtist")
+                if (fullArtist.isNotBlank() && !fullArtist.equals(primaryArtist, ignoreCase = true)) {
+                    add("$cleanTitle $fullArtist")
+                }
+            }.distinct()
+
+            for (q in searchQueries) {
+                val searched = runCatching {
+                    searchJioSaavnCatalog(q, page = 1, limit = 15)
+                }.getOrDefault(emptyList())
+
+                val verifiedMatches = searched.mapNotNull { candidate ->
+                    val candScore = scoreAndVerifyLyricsCandidate(
+                        targetCleanTitle = cleanTitle,
+                        primaryArtistTokens = primaryArtistTokens,
+                        allTargetArtistTokens = allTargetArtistTokens,
+                        candidateTitle = candidate.title,
+                        candidateArtist = candidate.artist,
+                        candidateAlbum = candidate.albumName,
+                        targetDurationSec = durationSec,
+                        candidateDurationSec = candidate.durationMs / 1000L,
+                        hasSynced = false
+                    ) ?: return@mapNotNull null
+                    candidate.id.removePrefix("saavn_").trim() to candScore
+                }.sortedByDescending { it.second }
+
+                verifiedMatches.take(4).forEach { (id, _) ->
+                    if (id.isNotBlank()) candidateSaavnIds.add(id)
+                }
+                if (candidateSaavnIds.size >= 3) break
             }
         }
 
-        for (saavnId in candidateSaavnIds.distinct()) {
+        for (saavnId in candidateSaavnIds.distinct().take(4)) {
             val endpoints = listOf(
                 "https://www.jiosaavn.com/api.php?__call=lyrics.getLyrics&ctx=web6dot0&api_version=4&_format=json&_marker=0&lyrics_id=$saavnId",
                 "https://saavn.sumit.co/api/songs/$saavnId/lyrics",
-                "https://saavn.dev/api/songs/$saavnId/lyrics"
+                "https://saavn.dev/api/songs/$saavnId/lyrics",
+                "https://jiosaavn-api-privatecvc2.vercel.app/lyrics?id=$saavnId"
             )
             for (endpoint in endpoints) {
                 val lyricsData = runCatching {
@@ -5693,9 +7097,10 @@ class MusicRepository(
                     val root = jsonParser.parseToJsonElement(text).objOrNull() ?: return@runCatching null
                     val rawLyrics = root["lyrics"].strOrNull()
                         ?: root["data"].objOrNull()?.get("lyrics").strOrNull()
+                        ?: root["lyrics_snippet"].strOrNull()
                         ?: return@runCatching null
                     val lines = parsePlainLyricsLines(rawLyrics)
-                    if (lines.size >= 2) {
+                    if (lines.size >= 4) {
                         LyricsData(
                             lines = lines,
                             isSynced = false,
@@ -5705,6 +7110,253 @@ class MusicRepository(
                 }.getOrNull()
                 if (lyricsData != null) return lyricsData
             }
+        }
+        return null
+    }
+
+    /**
+     * Queries NetEase Cloud Music LRC catalog with strict title + artist verification.
+     */
+    private suspend fun fetchNetEaseVerifiedLyrics(
+        rawTitle: String,
+        cleanTitle: String,
+        primaryArtist: String,
+        fullArtist: String,
+        durationSec: Long
+    ): LyricsData? {
+        if (cleanTitle.isBlank()) return null
+        val primaryArtistTokens = lyricsArtistTokens(primaryArtist)
+        val allTargetArtistTokens = buildSet {
+            addAll(primaryArtistTokens)
+            extractAllArtistCandidatesForLyrics(rawTitle, fullArtist.ifBlank { primaryArtist })
+                .forEach { addAll(lyricsArtistTokens(it)) }
+        }
+        if (allTargetArtistTokens.isEmpty()) return null
+
+        return runCatching {
+            val query = "$cleanTitle $primaryArtist".trim()
+            val searchUrl = "https://music.163.com/api/search/get/web?s=${urlEncode(query)}&type=1&offset=0&total=true&limit=10"
+            val searchJson = httpGet(
+                url = searchUrl,
+                headers = mapOf(
+                    "Referer" to "https://music.163.com",
+                    "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                )
+            )
+            val songsArr = jsonParser.parseToJsonElement(searchJson).objOrNull()
+                ?.get("result").objOrNull()
+                ?.get("songs").arrOrNull()
+                ?: return@runCatching null
+
+            val verifiedSongIds = songsArr.mapNotNull { elem ->
+                val obj = elem.objOrNull() ?: return@mapNotNull null
+                val id = obj["id"].longValOrNull() ?: return@mapNotNull null
+                val name = obj["name"].strOrNull() ?: return@mapNotNull null
+                val artistsStr = obj["artists"].arrOrNull()
+                    ?.mapNotNull { it.objOrNull()?.get("name").strOrNull() }
+                    ?.joinToString(", ")
+                    .orEmpty()
+                val albumStr = obj["album"].objOrNull()?.get("name").strOrNull().orEmpty()
+                val durSec = (obj["duration"].longValOrNull() ?: 0L) / 1000L
+
+                val score = scoreAndVerifyLyricsCandidate(
+                    targetCleanTitle = cleanTitle,
+                    primaryArtistTokens = primaryArtistTokens,
+                    allTargetArtistTokens = allTargetArtistTokens,
+                    candidateTitle = name,
+                    candidateArtist = artistsStr,
+                    candidateAlbum = albumStr,
+                    targetDurationSec = durationSec,
+                    candidateDurationSec = durSec.takeIf { it > 0L },
+                    hasSynced = true
+                ) ?: return@mapNotNull null
+
+                id to score
+            }.sortedByDescending { it.second }
+
+            for ((netEaseId, _) in verifiedSongIds.take(2)) {
+                val lyricUrl = "https://music.163.com/api/song/lyric?os=pc&id=$netEaseId&lv=-1&kv=-1&tv=-1"
+                val lyricJson = httpGet(
+                    url = lyricUrl,
+                    headers = mapOf("Referer" to "https://music.163.com")
+                )
+                val lyricRoot = jsonParser.parseToJsonElement(lyricJson).objOrNull() ?: continue
+                val lrcRaw = lyricRoot["lrc"].objOrNull()?.get("lyric").strOrNull()
+                if (!lrcRaw.isNullOrBlank()) {
+                    val syncedLines = parseLrcString(lrcRaw)
+                    if (syncedLines.size >= 4) {
+                        return@runCatching LyricsData(
+                            lines = syncedLines,
+                            isSynced = true,
+                            languageLabel = detectLyricsScriptLabel(syncedLines)
+                        )
+                    }
+                    val plainLines = parsePlainLyricsLines(lrcRaw)
+                    if (plainLines.size >= 4) {
+                        return@runCatching LyricsData(
+                            lines = plainLines,
+                            isSynced = false,
+                            languageLabel = detectLyricsScriptLabel(plainLines)
+                        )
+                    }
+                }
+            }
+            null
+        }.getOrNull()
+    }
+
+    /**
+     * Resolves official YouTube Music / YouTube caption tracks (`captionTracks` in `youtubei/v1/player`)
+     * for a strictly verified title + artist match so regional/Indian & indie songs with official
+     * video captions get timestamp-synced lyrics matching that exact artist.
+     */
+    private suspend fun fetchYouTubeVerifiedCaptionsLyrics(
+        songId: String,
+        rawTitle: String,
+        cleanTitle: String,
+        primaryArtist: String,
+        fullArtist: String,
+        durationSec: Long
+    ): LyricsData? {
+        if (cleanTitle.isBlank()) return null
+        val primaryArtistTokens = lyricsArtistTokens(primaryArtist)
+        val allTargetArtistTokens = buildSet {
+            addAll(primaryArtistTokens)
+            extractAllArtistCandidatesForLyrics(rawTitle, fullArtist.ifBlank { primaryArtist })
+                .forEach { addAll(lyricsArtistTokens(it)) }
+        }
+
+        val candidateVideoIds = mutableListOf<String>()
+        val isDirectYtId = songId.isNotBlank() &&
+            !songId.startsWith("saavn_") &&
+            !songId.startsWith("deezer_") &&
+            !songId.startsWith("itunes_") &&
+            !songId.startsWith("spotify_")
+        if (isDirectYtId) {
+            candidateVideoIds.add(songId)
+        }
+
+        val ytSearchResults = runCatching {
+            searchInnerTubeWebRemix("$cleanTitle $primaryArtist".trim()) +
+                searchYouTubeVideoCatalog("$cleanTitle $primaryArtist".trim())
+        }.getOrDefault(emptyList())
+
+        val verifiedYt = ytSearchResults.mapNotNull { item ->
+            val score = scoreAndVerifyLyricsCandidate(
+                targetCleanTitle = cleanTitle,
+                primaryArtistTokens = primaryArtistTokens,
+                allTargetArtistTokens = allTargetArtistTokens,
+                candidateTitle = item.title,
+                candidateArtist = item.artist,
+                candidateAlbum = item.albumName,
+                targetDurationSec = durationSec,
+                candidateDurationSec = item.durationMs / 1000L,
+                hasSynced = true
+            ) ?: return@mapNotNull null
+            item.id to score
+        }.sortedByDescending { it.second }
+
+        verifiedYt.take(2).forEach { (vid, _) -> candidateVideoIds.add(vid) }
+
+        for (videoId in candidateVideoIds.distinct().take(2)) {
+            val captionLyrics = runCatching {
+                val payload = buildJsonObject {
+                    put("videoId", videoId)
+                    put("racyCheckOk", true)
+                    put("contentCheckOk", true)
+                    putJsonObject("context") {
+                        putJsonObject("client") {
+                            put("clientName", "WEB")
+                            put("clientVersion", "2.20241118.01.00")
+                            put("hl", "en")
+                            put("gl", "IN")
+                        }
+                    }
+                }
+                val playerText = httpPostJson(
+                    url = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+                    jsonBody = payload.toString(),
+                    headers = mapOf(
+                        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                    )
+                )
+                val root = jsonParser.parseToJsonElement(playerText).objOrNull() ?: return@runCatching null
+                val videoDetails = root["videoDetails"].objOrNull()
+                val ytTitle = videoDetails?.get("title").strOrNull().orEmpty()
+                val ytAuthor = videoDetails?.get("author").strOrNull()
+                    ?.replace(Regex("\\s*-\\s*Topic$", RegexOption.IGNORE_CASE), "")
+                    .orEmpty()
+
+                // Double-check videoDetails title + author so we never use captions from an unrelated video
+                if (ytTitle.isNotBlank() && allTargetArtistTokens.isNotEmpty()) {
+                    val detailScore = scoreAndVerifyLyricsCandidate(
+                        targetCleanTitle = cleanTitle,
+                        primaryArtistTokens = primaryArtistTokens,
+                        allTargetArtistTokens = allTargetArtistTokens,
+                        candidateTitle = ytTitle,
+                        candidateArtist = ytAuthor,
+                        targetDurationSec = durationSec,
+                        candidateDurationSec = videoDetails?.get("lengthSeconds").strOrNull()?.toLongOrNull()
+                    )
+                    if (detailScore == null) return@runCatching null
+                }
+
+                val captionTracks = root["captions"].objOrNull()
+                    ?.get("playerCaptionsTracklistRenderer").objOrNull()
+                    ?.get("captionTracks").arrOrNull()
+                    ?.mapNotNull { it.objOrNull() }
+                    .orEmpty()
+                if (captionTracks.isEmpty()) return@runCatching null
+
+                // Prefer manual/artist-uploaded lyric caption tracks over ASR tracks
+                val chosenTrack = captionTracks.firstOrNull {
+                    it["kind"].strOrNull() != "asr"
+                } ?: captionTracks.first()
+
+                val baseUrl = chosenTrack["baseUrl"].strOrNull() ?: return@runCatching null
+                val json3Url = if (baseUrl.contains("fmt=")) {
+                    baseUrl.replace(Regex("fmt=[^&]+"), "fmt=json3")
+                } else {
+                    "$baseUrl&fmt=json3"
+                }
+
+                val captionBody = httpGet(json3Url)
+                val captionRoot = jsonParser.parseToJsonElement(captionBody).objOrNull() ?: return@runCatching null
+                val events = captionRoot["events"].arrOrNull() ?: return@runCatching null
+
+                val parsedLines = mutableListOf<LyricLine>()
+                for (evElem in events) {
+                    val ev = evElem.objOrNull() ?: continue
+                    val startMs = ev["tStartMs"].longValOrNull() ?: continue
+                    val segs = ev["segs"].arrOrNull() ?: continue
+                    val rawLine = segs.mapNotNull { it.objOrNull()?.get("utf8").strOrNull() }
+                        .joinToString("")
+                        .replace("\n", " ")
+                        .replace("♪", "")
+                        .replace("♫", "")
+                        .trim()
+                    if (rawLine.length < 2) continue
+                    if (rawLine.startsWith("[") && rawLine.endsWith("]")) continue
+                    if (rawLine.contains("http://", ignoreCase = true) ||
+                        rawLine.contains("https://", ignoreCase = true) ||
+                        rawLine.contains("subscribe", ignoreCase = true)
+                    ) continue
+
+                    val cleanLine = decodeHtmlEntities(rawLine)
+                    if (parsedLines.lastOrNull()?.text.equals(cleanLine, ignoreCase = true)) continue
+                    parsedLines.add(LyricLine(startTimeMs = startMs, text = cleanLine))
+                }
+
+                if (parsedLines.size >= 6) {
+                    LyricsData(
+                        lines = parsedLines,
+                        isSynced = true,
+                        languageLabel = detectLyricsScriptLabel(parsedLines)
+                    )
+                } else null
+            }.getOrNull()
+
+            if (captionLyrics != null) return captionLyrics
         }
         return null
     }
@@ -5728,11 +7380,8 @@ class MusicRepository(
     }
 
     /**
-     * Multi-stage real lyrics resolver:
-     * 1. Cleans movie/soundtrack tags from title and extracts primary artist
-     * 2. Queries LRCLIB Exact (`/api/get`) with track duration
-     * 3. Queries LRCLIB Fuzzy Search (`/api/search?q=...`) scored by exact duration match & multi-language variants
-     * 4. Queries Official JioSaavn Lyrics API & Lyrics.ovh for full scrollable plain lyrics
+     * Multi-stage real lyrics resolver with strict Title + Artist verification and Default Language Priority:
+     * Default Priority: 1. Romanized (Hinglish) -> 2. English -> 3. Original
      */
     suspend fun getSyncedLyrics(
         trackTitle: String,
@@ -5741,14 +7390,23 @@ class MusicRepository(
         songId: String = ""
     ): Result<LyricsData> = withContext(Dispatchers.IO) {
         runCatching {
-            val cleanTitle = cleanTrackTitleForLyrics(trackTitle)
             val primaryArtist = extractPrimaryArtistForLyrics(artist)
+            val cleanTitle = cleanTrackTitleForLyrics(trackTitle, artist)
+            val primaryArtistTokens = lyricsArtistTokens(primaryArtist)
+            val allTargetArtistTokens = buildSet {
+                addAll(primaryArtistTokens)
+                extractAllArtistCandidatesForLyrics(trackTitle, artist.ifBlank { primaryArtist })
+                    .forEach { addAll(lyricsArtistTokens(it)) }
+            }
+
             val durationBucket = if (durationSec > 0L) durationSec / 8L else 0L
-            val cacheKey = "${canonicalSongTitle(cleanTitle)}|${primaryArtist.lowercase()}|$durationBucket"
+            val cacheKey = "v3|${canonicalSongTitle(cleanTitle)}|${allTargetArtistTokens.sorted().joinToString("_")}|$durationBucket"
 
-            lyricsCache[cacheKey]?.let { return@runCatching it }
+            lyricsCache[cacheKey]?.let { cached ->
+                if (cached.lines.isNotEmpty()) return@runCatching cached
+            }
 
-            // Stage 1: LRCLIB Exact endpoint with cleaned title, primary artist & duration
+            // Stage 1: LRCLIB Exact endpoint with cleaned title, primary artist & duration (plus strict artist+title check)
             val exactResult = runCatching {
                 val url = buildString {
                     append("https://lrclib.net/api/get?track_name=")
@@ -5761,21 +7419,41 @@ class MusicRepository(
                     }
                 }
                 val responseText = httpGet(url)
-                val obj = jsonParser.parseToJsonElement(responseText).objOrNull()
+                val obj = jsonParser.parseToJsonElement(responseText).objOrNull() ?: return@runCatching null
+                val objTitle = obj["trackName"].strOrNull() ?: obj["name"].strOrNull() ?: cleanTitle
+                val objArtist = obj["artistName"].strOrNull().orEmpty()
+                val objAlbum = obj["albumName"].strOrNull().orEmpty()
+                val objDurSec = obj["duration"].longValOrNull()
+                    ?: obj["duration"].strOrNull()?.toDoubleOrNull()?.toLong()
+
+                val verifiedScore = scoreAndVerifyLyricsCandidate(
+                    targetCleanTitle = cleanTitle,
+                    primaryArtistTokens = primaryArtistTokens,
+                    allTargetArtistTokens = allTargetArtistTokens,
+                    candidateTitle = objTitle,
+                    candidateArtist = objArtist,
+                    candidateAlbum = objAlbum,
+                    targetDurationSec = durationSec,
+                    candidateDurationSec = objDurSec,
+                    hasSynced = !obj["syncedLyrics"].strOrNull().isNullOrBlank()
+                )
+                if (verifiedScore == null) return@runCatching null
+
                 parseLrclibObjectToLyricsData(obj)?.let { data ->
-                    data.copy(languageLabel = detectLyricsScriptLabel(data.lines, cleanTitle))
+                    data.copy(languageLabel = detectLyricsScriptLabel(data.lines, objTitle))
                 }
             }.getOrNull()
 
-            // Stage 2: LRCLIB Search (scored with duration proximity & collects genuine variants)
+            // Stage 2: LRCLIB Search (strictly verified against song title + artist & duration proximity)
             val (searchResult, searchVariants) = searchLrclibCatalogWithVariants(
+                rawTitle = trackTitle,
                 cleanTitle = cleanTitle,
                 primaryArtist = primaryArtist,
                 fullArtist = artist,
                 durationSec = durationSec
             )
 
-            val primary = when {
+            val primaryLrclib = when {
                 exactResult != null && exactResult.isSynced -> exactResult
                 searchResult != null && searchResult.isSynced -> searchResult
                 exactResult != null -> exactResult
@@ -5783,9 +7461,18 @@ class MusicRepository(
                 else -> null
             }
 
-            if (primary != null) {
-                val allVariants = buildList {
-                    if (searchResult != null && !searchResult.languageLabel.equals(primary.languageLabel, ignoreCase = true)) {
+            if (primaryLrclib != null) {
+                val extraVariants = buildList {
+                    if (exactResult != null && exactResult !== primaryLrclib) {
+                        add(
+                            LyricsVariant(
+                                languageLabel = exactResult.languageLabel,
+                                lines = exactResult.lines,
+                                isSynced = exactResult.isSynced
+                            )
+                        )
+                    }
+                    if (searchResult != null && searchResult !== primaryLrclib) {
                         add(
                             LyricsVariant(
                                 languageLabel = searchResult.languageLabel,
@@ -5794,24 +7481,57 @@ class MusicRepository(
                             )
                         )
                     }
-                    addAll(searchVariants.filter { !it.languageLabel.equals(primary.languageLabel, ignoreCase = true) })
-                }.distinctBy { it.languageLabel.lowercase() }
+                    addAll(searchVariants)
+                }
 
-                val enriched = primary.copy(alternateVariants = allVariants)
-                lyricsCache[cacheKey] = enriched
-                return@runCatching enriched
+                val prioritized = prioritizeLyricsVariants(primaryLrclib, extraVariants)
+                lyricsCache[cacheKey] = prioritized
+                return@runCatching prioritized
             }
 
-            // Stage 3: Official JioSaavn Lyrics API + Lyrics.ovh in parallel
-            val fallbackPlainLyrics = coroutineScope {
-                val saavnDef = async { fetchJioSaavnLyrics(songId, cleanTitle, primaryArtist) }
-                val ovhDef = async { fetchLyricsOvh(cleanTitle, primaryArtist) }
-                saavnDef.await() ?: ovhDef.await()
+            // Stage 3: Parallel verified lookup across NetEase LRC, Official JioSaavn Lyrics, YouTube Captions, and Lyrics.ovh
+            val fallbackLyrics = coroutineScope {
+                val netEaseDef = async {
+                    fetchNetEaseVerifiedLyrics(trackTitle, cleanTitle, primaryArtist, artist, durationSec)
+                }
+                val saavnDef = async {
+                    fetchJioSaavnLyrics(songId, trackTitle, cleanTitle, primaryArtist, artist, durationSec)
+                }
+                val ytCaptionsDef = async {
+                    fetchYouTubeVerifiedCaptionsLyrics(songId, trackTitle, cleanTitle, primaryArtist, artist, durationSec)
+                }
+                val ovhDef = async {
+                    fetchLyricsOvh(cleanTitle, primaryArtist)
+                }
+
+                val netEase = netEaseDef.await()
+                val saavn = saavnDef.await()
+                val ytCaptions = ytCaptionsDef.await()
+                val ovh = ovhDef.await()
+
+                val allCandidates = listOfNotNull(netEase, ytCaptions, saavn, ovh)
+                    .filter { it.lines.isNotEmpty() }
+
+                if (allCandidates.isEmpty()) {
+                    null
+                } else {
+                    val bestBase = allCandidates.firstOrNull { it.isSynced } ?: allCandidates.first()
+                    val otherVariants = allCandidates
+                        .filter { it !== bestBase }
+                        .map {
+                            LyricsVariant(
+                                languageLabel = it.languageLabel,
+                                lines = it.lines,
+                                isSynced = it.isSynced
+                            )
+                        }
+                    prioritizeLyricsVariants(bestBase, otherVariants)
+                }
             }
 
-            if (fallbackPlainLyrics != null) {
-                lyricsCache[cacheKey] = fallbackPlainLyrics
-                return@runCatching fallbackPlainLyrics
+            if (fallbackLyrics != null && fallbackLyrics.lines.isNotEmpty()) {
+                lyricsCache[cacheKey] = fallbackLyrics
+                return@runCatching fallbackLyrics
             }
 
             LyricsData(lines = emptyList(), isSynced = false)

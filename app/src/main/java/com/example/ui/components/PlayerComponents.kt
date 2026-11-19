@@ -32,6 +32,8 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.DragInteraction
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -237,13 +239,13 @@ fun SoftTonalCircleIconButton(
     val resolvedInactiveTint = inactiveTint.takeOrElse { AlabasterWhite }
     val baseContainer = containerColor.takeOrElse { CarbonSurface }
 
-    val resolvedContainer = when {
+    val targetContainer = when {
         !enabled -> CarbonSurface.copy(alpha = 0.55f)
         isActive -> resolvedActiveTint.copy(alpha = 0.16f)
         baseContainer == GlassSurface -> CarbonSurface
         else -> baseContainer
     }
-    val resolvedBorderColor = when {
+    val targetBorderColor = when {
         !enabled -> SubtleBorder.copy(alpha = 0.35f)
         isActive -> resolvedActiveTint.copy(alpha = 0.72f)
         baseContainer == ElectricMint -> ElectricMint
@@ -255,22 +257,61 @@ fun SoftTonalCircleIconButton(
         else -> resolvedInactiveTint
     }
 
+    val resolvedContainer by animateColorAsState(
+        targetValue = targetContainer,
+        animationSpec = tween(180),
+        label = "softCircleContainer"
+    )
+    val resolvedBorderColor by animateColorAsState(
+        targetValue = targetBorderColor,
+        animationSpec = tween(180),
+        label = "softCircleBorder"
+    )
+    val interactionSource = remember { MutableInteractionSource() }
+    val isPressed by interactionSource.collectIsPressedAsState()
+    val buttonScale by animateFloatAsState(
+        targetValue = if (isPressed && enabled) 0.88f else 1f,
+        animationSpec = spring(
+            dampingRatio = Spring.DampingRatioMediumBouncy,
+            stiffness = Spring.StiffnessMedium
+        ),
+        label = "softCirclePressScale"
+    )
+
     Box(
         modifier = modifier
             .minimumInteractiveComponentSize()
             .size(size)
+            .graphicsLayer {
+                scaleX = buttonScale
+                scaleY = buttonScale
+            }
             .clip(CircleShape)
             .background(resolvedContainer)
             .border(width = 0.85.dp, color = resolvedBorderColor, shape = CircleShape)
-            .clickable(enabled = enabled, onClick = onClick),
+            .clickable(
+                interactionSource = interactionSource,
+                indication = null,
+                enabled = enabled,
+                onClick = onClick
+            ),
         contentAlignment = Alignment.Center
     ) {
-        Icon(
-            imageVector = icon,
-            contentDescription = contentDescription,
-            tint = resolvedTint,
-            modifier = Modifier.size(iconSize)
-        )
+        AnimatedContent(
+            targetState = icon,
+            transitionSpec = {
+                (scaleIn(spring(dampingRatio = Spring.DampingRatioMediumBouncy)) + fadeIn(tween(130)))
+                    .togetherWith(scaleOut(tween(100)) + fadeOut(tween(100)))
+            },
+            label = "softCircleIconMorph"
+        ) { targetIcon ->
+            Icon(
+                imageVector = targetIcon,
+                contentDescription = contentDescription,
+                tint = resolvedTint,
+                modifier = Modifier.size(iconSize)
+            )
+        }
     }
 }
 
@@ -735,16 +776,25 @@ fun MiniPlayer(
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         MiniWaveformIndicator(isPlaying = isPlaying)
-                        Text(
-                            text = currentTrack.title,
-                            style = MaterialTheme.typography.titleSmall.copy(
-                                fontWeight = FontWeight.Bold
-                            ),
-                            color = AlabasterWhite,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
+                        AnimatedContent(
+                            targetState = currentTrack.title,
+                            transitionSpec = {
+                                (fadeIn(tween(180)) + slideInVertically { it / 3 })
+                                    .togetherWith(fadeOut(tween(130)) + slideOutVertically { -it / 3 })
+                            },
+                            label = "miniTitleMorph",
                             modifier = Modifier.weight(1f, fill = false)
-                        )
+                        ) { titleText ->
+                            Text(
+                                text = titleText,
+                                style = MaterialTheme.typography.titleSmall.copy(
+                                    fontWeight = FontWeight.Bold
+                                ),
+                                color = AlabasterWhite,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
                     }
                     Spacer(modifier = Modifier.height(2.dp))
                     Text(
@@ -770,14 +820,32 @@ fun MiniPlayer(
 
                 Spacer(modifier = Modifier.width(6.dp))
 
-                // Solid Mint Primary Play/Pause Button
+                // Solid Mint Primary Play/Pause Button with Tactile Spring Bounce
+                val miniPlayInteraction = remember { MutableInteractionSource() }
+                val isMiniPlayPressed by miniPlayInteraction.collectIsPressedAsState()
+                val miniPlayScale by animateFloatAsState(
+                    targetValue = if (isMiniPlayPressed) 0.88f else 1f,
+                    animationSpec = spring(
+                        dampingRatio = Spring.DampingRatioMediumBouncy,
+                        stiffness = Spring.StiffnessMedium
+                    ),
+                    label = "miniPlayBounce"
+                )
                 Box(
                     modifier = Modifier
                         .minimumInteractiveComponentSize()
                         .size(40.dp)
+                        .graphicsLayer {
+                            scaleX = miniPlayScale
+                            scaleY = miniPlayScale
+                        }
                         .clip(CircleShape)
                         .background(ElectricMint)
-                        .clickable(onClick = onTogglePlayPause)
+                        .clickable(
+                            interactionSource = miniPlayInteraction,
+                            indication = null,
+                            onClick = onTogglePlayPause
+                        )
                         .testTag("mini_player_play_pause_button"),
                     contentAlignment = Alignment.Center
                 ) {
@@ -1340,27 +1408,75 @@ private fun FrostedGlassCircleIconButton(
 ) {
     val resolvedActiveTint = activeTint.takeOrElse { ElectricMint }
     val resolvedInactiveTint = inactiveTint.takeOrElse { AlabasterWhite }
-    val resolvedContainer = containerColor.takeOrElse { CarbonSurface }
-    val resolvedBorder = borderColor.takeOrElse { SubtleBorder }
+    val baseContainer = containerColor.takeOrElse { CarbonSurface }
+    val baseBorder = borderColor.takeOrElse { SubtleBorder }
+
+    val animatedBg by animateColorAsState(
+        targetValue = if (isActive) resolvedActiveTint.copy(alpha = 0.16f) else baseContainer,
+        animationSpec = tween(180),
+        label = "frostedCircleBg"
+    )
+    val animatedBorder by animateColorAsState(
+        targetValue = if (isActive) resolvedActiveTint.copy(alpha = 0.75f) else baseBorder,
+        animationSpec = tween(180),
+        label = "frostedCircleBorder"
+    )
+    val animatedTint by animateColorAsState(
+        targetValue = if (isActive) resolvedActiveTint else resolvedInactiveTint,
+        animationSpec = tween(180),
+        label = "frostedCircleTint"
+    )
+    val interactionSource = remember { MutableInteractionSource() }
+    val isPressed by interactionSource.collectIsPressedAsState()
+    val buttonScale by animateFloatAsState(
+        targetValue = when {
+            isPressed -> 0.88f
+            isActive -> 1.04f
+            else -> 1f
+        },
+        animationSpec = spring(
+            dampingRatio = Spring.DampingRatioMediumBouncy,
+            stiffness = Spring.StiffnessMedium
+        ),
+        label = "frostedCircleScale"
+    )
+
     Box(
         modifier = modifier
             .size(size)
+            .graphicsLayer {
+                scaleX = buttonScale
+                scaleY = buttonScale
+            }
             .clip(CircleShape)
-            .background(if (isActive) resolvedActiveTint.copy(alpha = 0.16f) else resolvedContainer)
+            .background(animatedBg)
             .border(
-                width = 0.85.dp,
-                color = if (isActive) resolvedActiveTint.copy(alpha = 0.75f) else resolvedBorder,
+                width = if (isActive) 1.15.dp else 0.85.dp,
+                color = animatedBorder,
                 shape = CircleShape
             )
-            .clickable(onClick = onClick),
+            .clickable(
+                interactionSource = interactionSource,
+                indication = null,
+                onClick = onClick
+            ),
         contentAlignment = Alignment.Center
     ) {
-        Icon(
-            imageVector = icon,
-            contentDescription = contentDescription,
-            tint = if (isActive) resolvedActiveTint else resolvedInactiveTint,
-            modifier = Modifier.size(iconSize)
-        )
+        AnimatedContent(
+            targetState = icon,
+            transitionSpec = {
+                (scaleIn(spring(dampingRatio = Spring.DampingRatioMediumBouncy)) + fadeIn(tween(140)))
+                    .togetherWith(scaleOut(tween(110)) + fadeOut(tween(110)))
+            },
+            label = "frostedCircleIconMorph"
+        ) { targetIcon ->
+            Icon(
+                imageVector = targetIcon,
+                contentDescription = contentDescription,
+                tint = animatedTint,
+                modifier = Modifier.size(iconSize)
+            )
+        }
     }
 }
 
@@ -2547,13 +2663,23 @@ private fun SyncedLyricsTabContent(
         if (lyricsData == null) {
             emptyList()
         } else {
-            listOf(
+            val rawList = listOf(
                 LyricsVariant(
                     languageLabel = lyricsData.languageLabel.ifBlank { "Original" },
                     lines = lyricsData.lines,
                     isSynced = lyricsData.isSynced
                 )
             ) + lyricsData.alternateVariants
+            rawList.sortedWith(
+                compareBy<LyricsVariant> { variant ->
+                    val lower = variant.languageLabel.lowercase()
+                    when {
+                        lower.contains("romanized") || lower.contains("hinglish") -> 0
+                        lower == "english" || lower.contains("english") -> 1
+                        else -> 2
+                    }
+                }.thenByDescending { it.isSynced }
+            ).distinctBy { it.languageLabel.lowercase() }
         }
     }
     var selectedVariantIndex by remember(lyricsData) { mutableIntStateOf(0) }
@@ -3651,8 +3777,33 @@ private fun PlayerTransportSection(
                 animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy),
                 label = "playBtnSize"
             )
+            val playInteractionSource = remember { MutableInteractionSource() }
+            val isPlayPressed by playInteractionSource.collectIsPressedAsState()
+            val playPressScale by animateFloatAsState(
+                targetValue = if (isPlayPressed) 0.90f else 1f,
+                animationSpec = spring(
+                    dampingRatio = Spring.DampingRatioMediumBouncy,
+                    stiffness = Spring.StiffnessMedium
+                ),
+                label = "playBtnPressScale"
+            )
+            val haloPulseScale = if (isPlaying) {
+                val infiniteHalo = rememberInfiniteTransition(label = "playHaloPulse")
+                val pulse by infiniteHalo.animateFloat(
+                    initialValue = 0.96f,
+                    targetValue = 1.10f,
+                    animationSpec = infiniteRepeatable(
+                        animation = tween(durationMillis = 1500, easing = FastOutSlowInEasing),
+                        repeatMode = RepeatMode.Reverse
+                    ),
+                    label = "haloPulseScaleValue"
+                )
+                pulse
+            } else {
+                0.95f
+            }
 
-            // Centerpiece Glowing Play/Pause Button with Soft Radial Halo
+            // Centerpiece Glowing Play/Pause Button with Soft Breathing Radial Halo
             val haloColor = ElectricMint
             Box(
                 modifier = Modifier
@@ -3661,12 +3812,12 @@ private fun PlayerTransportSection(
                         drawCircle(
                             brush = Brush.radialGradient(
                                 colors = listOf(
-                                    haloColor.copy(alpha = 0.42f),
-                                    haloColor.copy(alpha = 0.14f),
+                                    haloColor.copy(alpha = if (isPlaying) 0.46f else 0.28f),
+                                    haloColor.copy(alpha = if (isPlaying) 0.16f else 0.08f),
                                     Color.Transparent
                                 )
                             ),
-                            radius = size.minDimension * 0.56f
+                            radius = size.minDimension * 0.56f * haloPulseScale
                         )
                     },
                 contentAlignment = Alignment.Center
@@ -3674,10 +3825,18 @@ private fun PlayerTransportSection(
                 Box(
                     modifier = Modifier
                         .size(playBtnSize)
+                        .graphicsLayer {
+                            scaleX = playPressScale
+                            scaleY = playPressScale
+                        }
                         .shadow(16.dp, CircleShape, spotColor = ElectricMint)
                         .clip(CircleShape)
                         .background(ElectricMint)
-                        .clickable(onClick = onTogglePlayPause)
+                        .clickable(
+                            interactionSource = playInteractionSource,
+                            indication = null,
+                            onClick = onTogglePlayPause
+                        )
                         .testTag("player_play_pause_button"),
                     contentAlignment = Alignment.Center
                 ) {

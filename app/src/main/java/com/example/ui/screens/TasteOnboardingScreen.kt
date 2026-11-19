@@ -2,10 +2,17 @@ package com.example.ui.screens
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
@@ -14,6 +21,8 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -71,6 +80,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.testTag
@@ -103,7 +113,7 @@ private const val MIN_ARTISTS_REQUIRED = 3
 
 /**
  * Full-screen 2-step first-launch music taste onboarding:
- * Step 1: Pick >= 3 genres (Indian + Global mix)
+ * Step 1: Pick >= 3 genres (Indian + Regional + Global mix)
  * Step 2: Pick >= 3 artists (Indian + Global mix + live search)
  */
 @Composable
@@ -175,6 +185,18 @@ fun TasteOnboardingScreen(
     val requiredCount = if (currentStep == 1) MIN_GENRES_REQUIRED else MIN_ARTISTS_REQUIRED
     val isStepReady = selectedCount >= requiredCount
 
+    val stepProgressFraction by animateFloatAsState(
+        targetValue = (
+            ((currentStep - 1) * 0.5f) +
+                (selectedCount.coerceAtMost(requiredCount).toFloat() / requiredCount.toFloat()) * 0.5f
+            ).coerceIn(0.08f, 1f),
+        animationSpec = spring(
+            dampingRatio = Spring.DampingRatioMediumBouncy,
+            stiffness = Spring.StiffnessMediumLow
+        ),
+        label = "onboardingStepProgress"
+    )
+
     val bgMint = ElectricMint
     val bgViolet = NeonViolet
     val bgCanvas = PitchBlack
@@ -205,12 +227,12 @@ fun TasteOnboardingScreen(
                 .widthIn(max = 640.dp)
                 .align(Alignment.Center)
         ) {
-            // Top Brand + Step Pill + Selection Counter
+            // Top Brand + Step Pill + Selection Counter + Smooth Progress Bar
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 20.dp, vertical = 14.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
+                verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -270,17 +292,33 @@ fun TasteOnboardingScreen(
                             animationSpec = tween(200),
                             label = "onboardingCounterBorder"
                         )
+                        val counterScale by animateFloatAsState(
+                            targetValue = if (isStepReady) 1.03f else 1f,
+                            animationSpec = spring(
+                                dampingRatio = Spring.DampingRatioMediumBouncy,
+                                stiffness = Spring.StiffnessMedium
+                            ),
+                            label = "onboardingCounterScale"
+                        )
                         Surface(
                             color = counterBg,
                             shape = RoundedCornerShape(50),
-                            border = BorderStroke(0.85.dp, counterBorder)
+                            border = BorderStroke(0.85.dp, counterBorder),
+                            modifier = Modifier.graphicsLayer {
+                                scaleX = counterScale
+                                scaleY = counterScale
+                            }
                         ) {
                             Row(
                                 modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(5.dp)
                             ) {
-                                if (isStepReady) {
+                                AnimatedVisibility(
+                                    visible = isStepReady,
+                                    enter = scaleIn(spring(dampingRatio = Spring.DampingRatioLowBouncy)) + fadeIn(tween(150)),
+                                    exit = scaleOut(tween(120)) + fadeOut(tween(120))
+                                ) {
                                     Icon(
                                         imageVector = Icons.Filled.CheckCircle,
                                         contentDescription = null,
@@ -326,6 +364,27 @@ fun TasteOnboardingScreen(
                     }
                 }
 
+                // Animated Progress Track
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(4.dp)
+                        .clip(RoundedCornerShape(50))
+                        .background(CarbonElevated)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth(stepProgressFraction)
+                            .height(4.dp)
+                            .clip(RoundedCornerShape(50))
+                            .background(
+                                Brush.horizontalGradient(
+                                    colors = listOf(ElectricMint, CyberCyan)
+                                )
+                            )
+                    )
+                }
+
                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text(
                         text = if (currentStep == 1) {
@@ -340,7 +399,7 @@ fun TasteOnboardingScreen(
                     )
                     Text(
                         text = if (currentStep == 1) {
-                            "Blend Indian and global sounds to personalize your Echoic Home feed."
+                            "Blend Indian, regional, and global sounds to personalize your Echoic Home feed."
                         } else {
                             "We'll auto-follow your picks and build your Your Taste Mix."
                         },
@@ -356,11 +415,21 @@ fun TasteOnboardingScreen(
                     targetState = currentStep,
                     transitionSpec = {
                         if (targetState > initialState) {
-                            (fadeIn(tween(240)) + slideInHorizontally { it / 5 })
-                                .togetherWith(fadeOut(tween(180)) + slideOutHorizontally { -it / 5 })
+                            (fadeIn(tween(240)) + slideInHorizontally(
+                                animationSpec = spring(
+                                    dampingRatio = Spring.DampingRatioNoBouncy,
+                                    stiffness = Spring.StiffnessMediumLow
+                                ),
+                                initialOffsetX = { it / 4 }
+                            )).togetherWith(fadeOut(tween(180)) + slideOutHorizontally { -it / 5 })
                         } else {
-                            (fadeIn(tween(240)) + slideInHorizontally { -it / 5 })
-                                .togetherWith(fadeOut(tween(180)) + slideOutHorizontally { it / 5 })
+                            (fadeIn(tween(240)) + slideInHorizontally(
+                                animationSpec = spring(
+                                    dampingRatio = Spring.DampingRatioNoBouncy,
+                                    stiffness = Spring.StiffnessMediumLow
+                                ),
+                                initialOffsetX = { -it / 4 }
+                            )).togetherWith(fadeOut(tween(180)) + slideOutHorizontally { it / 5 })
                         }
                     },
                     label = "tasteOnboardingStepTransition"
@@ -456,6 +525,20 @@ fun TasteOnboardingScreen(
                         }
                     }
 
+                    val ctaInteractionSource = remember { MutableInteractionSource() }
+                    val isCtaPressed by ctaInteractionSource.collectIsPressedAsState()
+                    val ctaScale by animateFloatAsState(
+                        targetValue = when {
+                            isCtaPressed && isStepReady -> 0.96f
+                            else -> 1f
+                        },
+                        animationSpec = spring(
+                            dampingRatio = Spring.DampingRatioMediumBouncy,
+                            stiffness = Spring.StiffnessMedium
+                        ),
+                        label = "onboardingCtaScale"
+                    )
+
                     Button(
                         onClick = {
                             focusManager.clearFocus()
@@ -469,6 +552,7 @@ fun TasteOnboardingScreen(
                             }
                         },
                         enabled = isStepReady,
+                        interactionSource = ctaInteractionSource,
                         shape = RoundedCornerShape(50),
                         colors = ButtonDefaults.buttonColors(
                             containerColor = ElectricMint,
@@ -479,6 +563,10 @@ fun TasteOnboardingScreen(
                         modifier = Modifier
                             .weight(1f)
                             .heightIn(min = 52.dp)
+                            .graphicsLayer {
+                                scaleX = ctaScale
+                                scaleY = ctaScale
+                            }
                             .testTag(if (currentStep == 1) "onboarding_continue_button" else "onboarding_finish_button")
                     ) {
                         val remaining = (requiredCount - selectedCount).coerceAtLeast(0)
@@ -489,19 +577,33 @@ fun TasteOnboardingScreen(
                             isStepReady -> "Start Listening"
                             else -> "Pick $remaining more artist${if (remaining == 1) "" else "s"}"
                         }
-                        Text(
-                            text = buttonText,
-                            style = MaterialTheme.typography.titleSmall.copy(
-                                fontWeight = FontWeight.ExtraBold
-                            )
-                        )
-                        if (currentStep == 1 && isStepReady) {
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Icon(
-                                imageVector = Icons.AutoMirrored.Outlined.ArrowForward,
-                                contentDescription = null,
-                                modifier = Modifier.size(18.dp)
-                            )
+                        AnimatedContent(
+                            targetState = buttonText,
+                            transitionSpec = {
+                                (fadeIn(tween(150)) + scaleIn(initialScale = 0.94f))
+                                    .togetherWith(fadeOut(tween(110)))
+                            },
+                            label = "onboardingCtaLabel"
+                        ) { label ->
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.Center
+                            ) {
+                                Text(
+                                    text = label,
+                                    style = MaterialTheme.typography.titleSmall.copy(
+                                        fontWeight = FontWeight.ExtraBold
+                                    )
+                                )
+                                if (currentStep == 1 && isStepReady) {
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Icon(
+                                        imageVector = Icons.AutoMirrored.Outlined.ArrowForward,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
+                            }
                         }
                     }
                 }
@@ -530,8 +632,23 @@ private fun GenreSelectionStepContent(
             key = { it.id }
         ) { genre ->
             val selected = isGenreSelected(genre)
+            val interactionSource = remember { MutableInteractionSource() }
+            val isPressed by interactionSource.collectIsPressedAsState()
+
+            val tileScale by animateFloatAsState(
+                targetValue = when {
+                    isPressed -> 0.94f
+                    selected -> 1.02f
+                    else -> 1f
+                },
+                animationSpec = spring(
+                    dampingRatio = Spring.DampingRatioMediumBouncy,
+                    stiffness = Spring.StiffnessMedium
+                ),
+                label = "genreTileScale"
+            )
             val containerColor by animateColorAsState(
-                targetValue = if (selected) ElectricMint.copy(alpha = 0.14f) else CarbonSurface,
+                targetValue = if (selected) ElectricMint.copy(alpha = 0.16f) else CarbonSurface,
                 animationSpec = tween(180),
                 label = "genreTileBg"
             )
@@ -540,19 +657,32 @@ private fun GenreSelectionStepContent(
                 animationSpec = tween(180),
                 label = "genreTileBorder"
             )
+            val borderWidth by animateDpAsState(
+                targetValue = if (selected) 1.5.dp else 0.8.dp,
+                animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy),
+                label = "genreTileBorderWidth"
+            )
 
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
                     .heightIn(min = 86.dp)
+                    .graphicsLayer {
+                        scaleX = tileScale
+                        scaleY = tileScale
+                    }
                     .clip(RoundedCornerShape(18.dp))
                     .background(containerColor)
                     .border(
-                        width = if (selected) 1.3.dp else 0.8.dp,
+                        width = borderWidth,
                         color = borderColor,
                         shape = RoundedCornerShape(18.dp)
                     )
-                    .clickable { onToggleGenre(genre) }
+                    .clickable(
+                        interactionSource = interactionSource,
+                        indication = null,
+                        onClick = { onToggleGenre(genre) }
+                    )
                     .padding(horizontal = 14.dp, vertical = 14.dp)
                     .testTag("onboarding_genre_${genre.id}")
             ) {
@@ -565,26 +695,45 @@ private fun GenreSelectionStepContent(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
+                        val noteScale by animateFloatAsState(
+                            targetValue = if (selected) 1.15f else 1f,
+                            animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy),
+                            label = "genreNoteScale"
+                        )
                         Icon(
                             imageVector = Icons.Outlined.MusicNote,
                             contentDescription = null,
                             tint = if (selected) ElectricMint else CyberCyan,
-                            modifier = Modifier.size(18.dp)
+                            modifier = Modifier
+                                .size(18.dp)
+                                .graphicsLayer {
+                                    scaleX = noteScale
+                                    scaleY = noteScale
+                                }
                         )
-                        if (selected) {
-                            Icon(
-                                imageVector = Icons.Filled.CheckCircle,
-                                contentDescription = "Selected ${genre.title}",
-                                tint = ElectricMint,
-                                modifier = Modifier.size(20.dp)
-                            )
-                        } else {
-                            Box(
-                                modifier = Modifier
-                                    .size(18.dp)
-                                    .clip(CircleShape)
-                                    .border(1.2.dp, DimSlate, CircleShape)
-                            )
+                        AnimatedContent(
+                            targetState = selected,
+                            transitionSpec = {
+                                (scaleIn(spring(dampingRatio = Spring.DampingRatioLowBouncy)) + fadeIn(tween(140)))
+                                    .togetherWith(scaleOut(tween(110)) + fadeOut(tween(110)))
+                            },
+                            label = "genreCheckPop"
+                        ) { isChecked ->
+                            if (isChecked) {
+                                Icon(
+                                    imageVector = Icons.Filled.CheckCircle,
+                                    contentDescription = "Selected ${genre.title}",
+                                    tint = ElectricMint,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            } else {
+                                Box(
+                                    modifier = Modifier
+                                        .size(18.dp)
+                                        .clip(CircleShape)
+                                        .border(1.2.dp, DimSlate, CircleShape)
+                                )
+                            }
                         }
                     }
 
@@ -752,17 +901,45 @@ private fun OnboardingArtistCard(
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val isPressed by interactionSource.collectIsPressedAsState()
+
+    val cardScale by animateFloatAsState(
+        targetValue = when {
+            isPressed -> 0.92f
+            isSelected -> 1.04f
+            else -> 1f
+        },
+        animationSpec = spring(
+            dampingRatio = Spring.DampingRatioMediumBouncy,
+            stiffness = Spring.StiffnessMedium
+        ),
+        label = "artistCardScale"
+    )
     val ringColor by animateColorAsState(
         targetValue = if (isSelected) ElectricMint else SubtleBorder,
         animationSpec = tween(180),
         label = "artistRingColor"
     )
+    val ringWidth by animateDpAsState(
+        targetValue = if (isSelected) 2.5.dp else 0.9.dp,
+        animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy),
+        label = "artistRingWidth"
+    )
 
     Column(
         modifier = modifier
             .fillMaxWidth()
+            .graphicsLayer {
+                scaleX = cardScale
+                scaleY = cardScale
+            }
             .clip(RoundedCornerShape(16.dp))
-            .clickable(onClick = onClick)
+            .clickable(
+                interactionSource = interactionSource,
+                indication = null,
+                onClick = onClick
+            )
             .padding(vertical = 6.dp, horizontal = 4.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(8.dp)
@@ -777,7 +954,7 @@ private fun OnboardingArtistCard(
                     .clip(CircleShape)
                     .background(CarbonElevated)
                     .border(
-                        width = if (isSelected) 2.2.dp else 0.9.dp,
+                        width = ringWidth,
                         color = ringColor,
                         shape = CircleShape
                     ),
@@ -810,10 +987,19 @@ private fun OnboardingArtistCard(
                 }
             }
 
-            if (isSelected) {
+            androidx.compose.animation.AnimatedVisibility(
+                visible = isSelected,
+                enter = scaleIn(
+                    animationSpec = spring(
+                        dampingRatio = Spring.DampingRatioLowBouncy,
+                        stiffness = Spring.StiffnessMedium
+                    )
+                ) + fadeIn(tween(140)),
+                exit = scaleOut(tween(110)) + fadeOut(tween(110)),
+                modifier = Modifier.align(Alignment.BottomEnd)
+            ) {
                 Box(
                     modifier = Modifier
-                        .align(Alignment.BottomEnd)
                         .size(26.dp)
                         .clip(CircleShape)
                         .background(ElectricMint)

@@ -22,8 +22,10 @@ import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.database.StandaloneDatabaseProvider
+import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.datasource.ResolvingDataSource
 import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
 import androidx.media3.datasource.cache.SimpleCache
@@ -108,6 +110,7 @@ class PlaybackService : MediaSessionService() {
     private var preparedCrossfadeSongId: String? = null
     private var preparedCrossfadeUrl: String? = null
     private var crossfadeTriggeredTrackId: String? = null
+    private var serviceConsecutiveFailures: Int = 0
     private val servicePlaySeq = java.util.concurrent.atomic.AtomicLong(0L)
 
     override fun onCreate() {
@@ -140,19 +143,24 @@ class PlaybackService : MediaSessionService() {
         }
 
         // 1. Configure 500MB LRU Disk Cache wrapped in CacheDataSource.Factory
+        // Use ResolvingDataSource so YouTube googlevideo.com streams (c=ANDROID_VR, c=IOS, etc.)
+        // receive the exact matching client User-Agent header instead of getting HTTP 403 Forbidden.
         val simpleCache = getOrCreateCache(applicationContext)
         val upstreamHttpFactory = DefaultHttpDataSource.Factory()
-            .setUserAgent(
-                "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
-            )
+            .setUserAgent(null)
             .setConnectTimeoutMs(8_000)
             .setReadTimeoutMs(12_000)
             .setAllowCrossProtocolRedirects(true)
-        val upstreamFactory = DefaultDataSource.Factory(applicationContext, upstreamHttpFactory)
+        val baseUpstreamFactory = DefaultDataSource.Factory(applicationContext, upstreamHttpFactory)
+        val resolvingUpstreamFactory = ResolvingDataSource.Factory(baseUpstreamFactory) { dataSpec: DataSpec ->
+            val urlString = dataSpec.uri.toString()
+            val dynamicUserAgent = MusicRepository.resolveStreamUserAgent(urlString)
+            dataSpec.withAdditionalHeaders(mapOf("User-Agent" to dynamicUserAgent))
+        }
 
         cacheDataSourceFactory = CacheDataSource.Factory()
             .setCache(simpleCache)
-            .setUpstreamDataSourceFactory(upstreamFactory)
+            .setUpstreamDataSourceFactory(resolvingUpstreamFactory)
             .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
 
         // 2. Configure DefaultLoadControl tuned for ultra-fast 500ms audio start
@@ -224,16 +232,15 @@ class PlaybackService : MediaSessionService() {
 
             override fun onPlaybackStateChanged(playbackState: Int) {
                 if (playbackState == Player.STATE_READY) {
+                    serviceConsecutiveFailures = 0
                     val activeSong = activeServiceSong ?: extractSongFromMediaItem(player.currentMediaItem)
                     if (activeSong != null) {
                         MiniPlayerWidgetProvider.syncWidget(applicationContext, activeSong, player.isPlaying)
                         scheduleLookaheadPreResolve(activeSong)
                     }
                 } else if (playbackState == Player.STATE_ENDED) {
-                    if (activeCrossfadeJob?.isActive == true) {
-                        return
-                    }
                     if (stopAfterCurrentTrackFlag) {
+                        cancelActiveCrossfade()
                         stopAfterCurrentTrackFlag = false
                         player.pause()
                         MiniPlayerWidgetProvider.syncWidget(
@@ -245,11 +252,19 @@ class PlaybackService : MediaSessionService() {
                         serviceScope.launch {
                             _serviceEvents.emit(ServicePlaybackEvent.SleepTimerEndedTrack)
                         }
-                    } else if (player.repeatMode == Player.REPEAT_MODE_ONE) {
+                        return
+                    }
+                    if (activeCrossfadeJob?.isActive == true) {
+                        // Active crossfade loop watches STATE_ENDED and completes the handoff immediately;
+                        // its finally block falls back to handleBackgroundSkipNext if handoff didn't run.
+                        return
+                    }
+                    if (player.repeatMode == Player.REPEAT_MODE_ONE) {
                         player.seekTo(0L)
+                        player.playWhenReady = true
                         player.play()
                     } else {
-                        // Autonomous screen-off background auto-advance
+                        // Autonomous background auto-advance (foreground or screen-off)
                         handleBackgroundSkipNext(autoTriggered = true)
                     }
                 }
@@ -263,19 +278,26 @@ class PlaybackService : MediaSessionService() {
                         repository.getAlternateStreamUrl(activeSong, activeSong.streamUrl)
                     }
                     if (!alternateUrl.isNullOrBlank()) {
+                        serviceConsecutiveFailures = 0
                         val recoveredSong = activeSong.copy(streamUrl = alternateUrl)
                         activeServiceSong = recoveredSong
                         replaceSongInServiceQueue(recoveredSong)
                         player.stop()
                         player.clearMediaItems()
                         player.setMediaItem(buildMediaItemForSong(recoveredSong))
+                        player.playWhenReady = true
                         player.prepare()
                         player.play()
                         MiniPlayerWidgetProvider.syncWidget(applicationContext, recoveredSong, true)
                         _serviceEvents.emit(ServicePlaybackEvent.TrackTransitioned(recoveredSong))
                     } else {
-                        MiniPlayerWidgetProvider.syncWidget(applicationContext, activeSong, false)
-                        _serviceEvents.emit(ServicePlaybackEvent.StreamUnavailable(activeSong))
+                        serviceConsecutiveFailures++
+                        if (serviceConsecutiveFailures < 3 && serviceQueue.size > 1) {
+                            handleBackgroundSkipNext(autoTriggered = true)
+                        } else {
+                            MiniPlayerWidgetProvider.syncWidget(applicationContext, activeSong, false)
+                            _serviceEvents.emit(ServicePlaybackEvent.StreamUnavailable(activeSong))
+                        }
                     }
                 }
             }
@@ -452,6 +474,21 @@ class PlaybackService : MediaSessionService() {
                         persistServiceSessionSnapshot()
                     }
 
+                    // Proactively replenish upcoming queue inside service so Crossfade & Gapless always have next track ready
+                    val queueSnapshot = serviceQueue
+                    val curIdx = queueSnapshot.indexOfFirst { it.id == activeSong.id }
+                    val remainingAhead = if (curIdx >= 0) (queueSnapshot.lastIndex - curIdx) else queueSnapshot.lastIndex
+                    if (autoQueueEnabled &&
+                        player.repeatMode == Player.REPEAT_MODE_OFF &&
+                        remainingAhead < 4 &&
+                        backgroundAutoQueueJob?.isActive != true
+                    ) {
+                        val seed = queueSnapshot.lastOrNull() ?: activeSong
+                        backgroundAutoQueueJob = serviceScope.launch {
+                            fetchAndAppendServiceRadioBatch(seed, serviceQueue)
+                        }
+                    }
+
                     val cfSec = crossfadeSeconds
                     val totalDur = player.duration
                     val currentPos = player.currentPosition.coerceAtLeast(0L)
@@ -532,84 +569,125 @@ class PlaybackService : MediaSessionService() {
     private fun launchDualPlayerCrossfade(incomingSong: SongItem, fadeDurationMs: Long) {
         activeCrossfadeJob?.cancel()
         activeCrossfadeJob = serviceScope.launch {
-            val resolvedUrl = if (preparedCrossfadeSongId == incomingSong.id && !preparedCrossfadeUrl.isNullOrBlank()) {
-                preparedCrossfadeUrl!!
-            } else {
-                withContext(Dispatchers.IO) {
-                    if (repository.isFullLengthStreamUrl(incomingSong.streamUrl)) {
-                        incomingSong.streamUrl
-                    } else {
-                        repository.getStreamUrl(
-                            videoId = incomingSong.id,
-                            trackTitle = incomingSong.title,
-                            artistName = incomingSong.artist
-                        ).getOrDefault("")
+            var handoffCompleted = false
+            var userPausedDuringFade = false
+            try {
+                val resolvedUrl = if (preparedCrossfadeSongId == incomingSong.id && !preparedCrossfadeUrl.isNullOrBlank()) {
+                    preparedCrossfadeUrl!!
+                } else {
+                    withContext(Dispatchers.IO) {
+                        val localUri = repository.getOfflineLocalFileUri(incomingSong.id)
+                        when {
+                            !localUri.isNullOrBlank() -> localUri
+                            repository.isFullLengthStreamUrl(incomingSong.streamUrl) -> incomingSong.streamUrl
+                            else -> repository.getStreamUrl(
+                                videoId = incomingSong.id,
+                                trackTitle = incomingSong.title,
+                                artistName = incomingSong.artist
+                            ).getOrDefault("")
+                        }
+                    }
+                }
+
+                if (resolvedUrl.isBlank()) {
+                    return@launch
+                }
+
+                val updatedNext = incomingSong.copy(streamUrl = resolvedUrl)
+                replaceSongInServiceQueue(updatedNext)
+
+                val cfPlayer = getOrCreateCrossfadePlayer()
+                if (preparedCrossfadeSongId != updatedNext.id || cfPlayer.mediaItemCount == 0) {
+                    cfPlayer.stop()
+                    cfPlayer.clearMediaItems()
+                    cfPlayer.setMediaItem(buildMediaItemForSong(updatedNext))
+                    cfPlayer.prepare()
+                }
+                cfPlayer.volume = 0.02f
+                cfPlayer.play()
+
+                val stepMs = 40L
+                val steps = (fadeDurationMs / stepMs).toInt().coerceIn(12, 240)
+                for (step in 1..steps) {
+                    if (!isActive) return@launch
+                    if (!player.playWhenReady || stopAfterCurrentTrackFlag) {
+                        userPausedDuringFade = true
+                        cfPlayer.pause()
+                        player.volume = 1.0f
+                        return@launch
+                    }
+                    // If the outgoing primary track finishes early while fading, break straight into handoff
+                    if (player.playbackState == Player.STATE_ENDED ||
+                        player.playbackState == Player.STATE_IDLE ||
+                        !player.isPlaying
+                    ) {
+                        break
+                    }
+                    val t = step.toFloat() / steps.toFloat()
+                    // Equal-power fade curve avoids volume dip in the middle of overlap
+                    val outgoingVol = cos(t * (PI / 2.0)).toFloat().coerceIn(0f, 1f)
+                    val incomingVol = sin(t * (PI / 2.0)).toFloat().coerceIn(0f, 1f)
+                    player.volume = outgoingVol
+                    cfPlayer.volume = incomingVol
+                    delay(stepMs)
+                }
+
+                val handoffPosMs = cfPlayer.currentPosition.coerceAtLeast(0L)
+                cfPlayer.pause()
+                cfPlayer.stop()
+                cfPlayer.clearMediaItems()
+                cfPlayer.volume = 0f
+                preparedCrossfadeSongId = null
+                preparedCrossfadeUrl = null
+
+                // Seamlessly hand playback to primary MediaSession player at exact crossfaded offset
+                serviceConsecutiveFailures = 0
+                activeServiceSong = updatedNext
+                player.stop()
+                player.clearMediaItems()
+                player.setMediaItem(buildMediaItemForSong(updatedNext))
+                if (handoffPosMs > 200L) {
+                    player.seekTo(handoffPosMs)
+                }
+                player.volume = 1.0f
+                player.playWhenReady = true
+                player.prepare()
+                player.play()
+                handoffCompleted = true
+
+                updateNotificationActionButtons(
+                    isFavorite = updatedNext.isFavorite,
+                    isShuffled = isServiceShuffled
+                )
+                MiniPlayerWidgetProvider.syncWidget(applicationContext, updatedNext, true)
+                persistServiceSessionSnapshot()
+                _serviceEvents.emit(ServicePlaybackEvent.TrackTransitioned(updatedNext))
+                scheduleLookaheadPreResolve(updatedNext)
+            } finally {
+                if (!handoffCompleted) {
+                    if (::player.isInitialized && fadeOutJob?.isActive != true) {
+                        player.volume = 1.0f
+                    }
+                    runCatching {
+                        crossfadePlayer?.let { cf ->
+                            cf.pause()
+                            cf.stop()
+                            cf.clearMediaItems()
+                            cf.volume = 0f
+                        }
+                    }
+                    // Guarantee playback never stalls at STATE_ENDED if crossfade failed mid-way
+                    if (!userPausedDuringFade &&
+                        !stopAfterCurrentTrackFlag &&
+                        ::player.isInitialized &&
+                        player.playbackState == Player.STATE_ENDED
+                    ) {
+                        serviceScope.launch {
+                            handleBackgroundSkipNext(autoTriggered = true)
+                        }
                     }
                 }
             }
-
-            if (resolvedUrl.isBlank()) {
-                return@launch
-            }
-
-            val updatedNext = incomingSong.copy(streamUrl = resolvedUrl)
-            replaceSongInServiceQueue(updatedNext)
-
-            val cfPlayer = getOrCreateCrossfadePlayer()
-            if (preparedCrossfadeSongId != updatedNext.id || cfPlayer.mediaItemCount == 0) {
-                cfPlayer.stop()
-                cfPlayer.clearMediaItems()
-                cfPlayer.setMediaItem(buildMediaItemForSong(updatedNext))
-                cfPlayer.prepare()
-            }
-            cfPlayer.volume = 0.02f
-            cfPlayer.play()
-
-            val stepMs = 40L
-            val steps = (fadeDurationMs / stepMs).toInt().coerceIn(12, 240)
-            for (step in 1..steps) {
-                if (!isActive || !player.isPlaying) {
-                    cfPlayer.pause()
-                    player.volume = 1.0f
-                    return@launch
-                }
-                val t = step.toFloat() / steps.toFloat()
-                // Equal-power fade curve avoids volume dip in the middle of overlap
-                val outgoingVol = cos(t * (PI / 2.0)).toFloat().coerceIn(0f, 1f)
-                val incomingVol = sin(t * (PI / 2.0)).toFloat().coerceIn(0f, 1f)
-                player.volume = outgoingVol
-                cfPlayer.volume = incomingVol
-                delay(stepMs)
-            }
-
-            val handoffPosMs = cfPlayer.currentPosition.coerceAtLeast(0L)
-            cfPlayer.pause()
-            cfPlayer.stop()
-            cfPlayer.clearMediaItems()
-            cfPlayer.volume = 0f
-            preparedCrossfadeSongId = null
-            preparedCrossfadeUrl = null
-
-            // Seamlessly hand playback to primary MediaSession player at exact crossfaded offset
-            activeServiceSong = updatedNext
-            player.stop()
-            player.clearMediaItems()
-            player.setMediaItem(buildMediaItemForSong(updatedNext))
-            if (handoffPosMs > 200L) {
-                player.seekTo(handoffPosMs)
-            }
-            player.volume = 1.0f
-            player.prepare()
-            player.play()
-
-            updateNotificationActionButtons(
-                isFavorite = updatedNext.isFavorite,
-                isShuffled = isServiceShuffled
-            )
-            MiniPlayerWidgetProvider.syncWidget(applicationContext, updatedNext, true)
-            persistServiceSessionSnapshot()
-            _serviceEvents.emit(ServicePlaybackEvent.TrackTransitioned(updatedNext))
-            scheduleLookaheadPreResolve(updatedNext)
         }
     }
 
@@ -729,16 +807,20 @@ class PlaybackService : MediaSessionService() {
      */
     private fun handleBackgroundSkipNext(autoTriggered: Boolean) {
         cancelActiveCrossfade()
-        val queueSnapshot = serviceQueue
+        if (!autoTriggered) {
+            serviceConsecutiveFailures = 0
+        }
+        val queueSnapshot = serviceQueue.ifEmpty {
+            listOfNotNull(activeServiceSong)
+        }
         if (queueSnapshot.isEmpty()) return
 
         val currentId = activeServiceSong?.id ?: player.currentMediaItem?.mediaId
         val currentIndex = queueSnapshot.indexOfFirst { it.id == currentId }
         val remainingAhead = if (currentIndex >= 0) (queueSnapshot.lastIndex - currentIndex) else queueSnapshot.lastIndex
 
-        if (autoQueueEnabled &&
-            player.repeatMode == Player.REPEAT_MODE_OFF &&
-            currentIndex >= queueSnapshot.lastIndex
+        if (player.repeatMode == Player.REPEAT_MODE_OFF &&
+            (currentIndex >= queueSnapshot.lastIndex || queueSnapshot.size <= 1)
         ) {
             val seed = activeServiceSong ?: queueSnapshot.lastOrNull() ?: return
             val seq = servicePlaySeq.incrementAndGet()
@@ -753,22 +835,16 @@ class PlaybackService : MediaSessionService() {
                 if (seq != servicePlaySeq.get()) return@launch
                 if (added.isNotEmpty()) {
                     resolveAndPlayInService(added.first())
-                } else if (!autoTriggered) {
-                    resolveAndPlayInService(queueSnapshot.first())
                 } else {
-                    player.pause()
-                    player.seekTo(0L)
+                    val otherTracks = queueSnapshot.filter { it.id != currentId }
+                    val fallbackTrack = if (otherTracks.isNotEmpty()) {
+                        if (isServiceShuffled) otherTracks.random() else otherTracks.first()
+                    } else {
+                        queueSnapshot.first()
+                    }
+                    resolveAndPlayInService(fallbackTrack)
                 }
             }
-            return
-        }
-
-        if (autoTriggered &&
-            player.repeatMode == Player.REPEAT_MODE_OFF &&
-            currentIndex == queueSnapshot.lastIndex
-        ) {
-            player.pause()
-            player.seekTo(0L)
             return
         }
 
@@ -785,7 +861,11 @@ class PlaybackService : MediaSessionService() {
             }
         }
 
-        val nextIndex = (currentIndex + 1).coerceAtLeast(0) % queueSnapshot.size
+        val nextIndex = if (currentIndex >= 0) {
+            (currentIndex + 1) % queueSnapshot.size
+        } else {
+            0
+        }
         val targetSong = queueSnapshot[nextIndex]
         resolveAndPlayInService(targetSong)
     }
@@ -807,12 +887,13 @@ class PlaybackService : MediaSessionService() {
             )
         }.getOrDefault(emptyList())
 
-        if (fetched.isNotEmpty()) {
-            val merged = (serviceQueue + fetched).distinctBy { it.id }
+        val orderedFetched = if (isServiceShuffled) fetched.shuffled() else fetched
+        if (orderedFetched.isNotEmpty()) {
+            val merged = (serviceQueue + orderedFetched).distinctBy { it.id }
             syncQueueFromUi(merged, activeServiceSong)
-            _serviceEvents.emit(ServicePlaybackEvent.AutoQueueReplenished(fetched))
+            _serviceEvents.emit(ServicePlaybackEvent.AutoQueueReplenished(orderedFetched))
         }
-        return fetched
+        return orderedFetched
     }
 
     /**
@@ -820,6 +901,7 @@ class PlaybackService : MediaSessionService() {
      */
     private fun handleBackgroundSkipPrevious() {
         cancelActiveCrossfade()
+        serviceConsecutiveFailures = 0
         val queueSnapshot = serviceQueue
         if (queueSnapshot.isEmpty()) {
             player.seekTo(0L)
@@ -873,11 +955,17 @@ class PlaybackService : MediaSessionService() {
             }
 
             if (resolvedUrl.isBlank()) {
-                MiniPlayerWidgetProvider.syncWidget(applicationContext, targetSong, false)
-                _serviceEvents.emit(ServicePlaybackEvent.StreamUnavailable(targetSong))
+                serviceConsecutiveFailures++
+                if (serviceConsecutiveFailures < 3 && serviceQueue.size > 1) {
+                    handleBackgroundSkipNext(autoTriggered = true)
+                } else {
+                    MiniPlayerWidgetProvider.syncWidget(applicationContext, targetSong, false)
+                    _serviceEvents.emit(ServicePlaybackEvent.StreamUnavailable(targetSong))
+                }
                 return@launch
             }
 
+            serviceConsecutiveFailures = 0
             val updatedSong = targetSong.copy(streamUrl = resolvedUrl)
             activeServiceSong = updatedSong
             replaceSongInServiceQueue(updatedSong)
@@ -889,6 +977,7 @@ class PlaybackService : MediaSessionService() {
             if (startPositionMs > 0L) {
                 player.seekTo(startPositionMs)
             }
+            player.playWhenReady = true
             player.prepare()
             player.play()
 
@@ -912,11 +1001,33 @@ class PlaybackService : MediaSessionService() {
         lookaheadPreResolveJob?.cancel()
         lookaheadPreResolveJob = serviceScope.launch(Dispatchers.IO) {
             delay(1_200L)
-            val queueSnapshot = serviceQueue
-            if (queueSnapshot.size <= 1) return@launch
+            var queueSnapshot = serviceQueue
+            if (queueSnapshot.isEmpty()) return@launch
             val currentIdx = queueSnapshot.indexOfFirst { it.id == currentSong.id }
             if (currentIdx < 0) return@launch
-            val nextIdx = (currentIdx + 1) % queueSnapshot.size
+
+            val currentRepeatMode = withContext(Dispatchers.Main) {
+                if (::player.isInitialized) player.repeatMode else Player.REPEAT_MODE_OFF
+            }
+
+            // On Repeat OFF at the tail of the queue, proactively refill Auto-Queue Radio
+            // instead of wrapping around to index 0.
+            if (currentIdx >= queueSnapshot.lastIndex && currentRepeatMode == Player.REPEAT_MODE_OFF) {
+                if (autoQueueEnabled) {
+                    val added = fetchAndAppendServiceRadioBatch(currentSong, queueSnapshot)
+                    if (added.isNotEmpty()) {
+                        queueSnapshot = serviceQueue
+                    } else {
+                        return@launch
+                    }
+                } else {
+                    return@launch
+                }
+            }
+
+            val updatedCurrentIdx = queueSnapshot.indexOfFirst { it.id == currentSong.id }
+            if (updatedCurrentIdx < 0 || queueSnapshot.size <= 1) return@launch
+            val nextIdx = (updatedCurrentIdx + 1) % queueSnapshot.size
             val nextSong = queueSnapshot[nextIdx]
             if (nextSong.id == currentSong.id) return@launch
 

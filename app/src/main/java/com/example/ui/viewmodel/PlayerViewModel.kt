@@ -418,9 +418,12 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         sessionAutoQueuedIds.addAll(session.autoQueuedIds)
         if (!session.isShuffled) {
             unshuffledQueueBackup = emptyList()
+        } else if (unshuffledQueueBackup.isEmpty()) {
+            unshuffledQueueBackup = restoredQueue
         }
 
         PlaybackService.syncQueueFromUi(restoredQueue, restoredTrack)
+        syncAutoQueueMetadataToService()
         MiniPlayerWidgetProvider.syncWidget(app, restoredTrack, false)
         fetchLyricsForTrack(restoredTrack)
     }
@@ -452,6 +455,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                     is PlaybackService.ServicePlaybackEvent.TrackTransitioned -> {
                         val song = event.song
                         val previousId = _currentTrack.value?.id
+                        consecutiveStreamFailures = 0
                         _currentTrack.value = song
                         _isResolvingStream.value = false
                         _isPlaying.value = true
@@ -473,7 +477,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                     }
                     is PlaybackService.ServicePlaybackEvent.AutoQueueReplenished -> {
                         if (event.songs.isNotEmpty()) {
-                            appendAutoQueuedTracks(event.songs)
+                            appendAutoQueuedTracks(event.songs, alreadyOrderedByService = true)
                         }
                     }
                     is PlaybackService.ServicePlaybackEvent.StreamUnavailable -> {
@@ -1010,10 +1014,20 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
 
     private fun hydrateOnboardingArtistPortraits() {
         viewModelScope.launch {
-            val hydrated = runCatching {
-                repository.hydrateArtistPortraitUrls(_onboardingArtists.value)
-            }.getOrNull() ?: return@launch
-            _onboardingArtists.value = hydrated
+            val currentList = _onboardingArtists.value.toMutableList()
+            if (currentList.all { it.artworkUrl.isNotBlank() }) return@launch
+            for (indices in currentList.indices.chunked(8)) {
+                val slice = indices.map { currentList[it] }
+                val hydratedSlice = runCatching {
+                    repository.hydrateArtistPortraitUrls(slice)
+                }.getOrNull() ?: continue
+                indices.forEachIndexed { localIdx, targetIdx ->
+                    if (targetIdx in currentList.indices && localIdx in hydratedSlice.indices) {
+                        currentList[targetIdx] = hydratedSlice[localIdx]
+                    }
+                }
+                _onboardingArtists.value = currentList.toList()
+            }
         }
     }
 
@@ -1764,6 +1778,9 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
     private fun attachControllerListener(controller: MediaController) {
         controller.addListener(object : Player.Listener {
             override fun onIsPlayingChanged(isPlaying: Boolean) {
+                if (!isPlaying && _isResolvingStream.value) {
+                    return
+                }
                 _isPlaying.value = isPlaying
                 if (!isPlaying) {
                     persistPlaybackSession()
@@ -2213,7 +2230,10 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    private fun appendAutoQueuedTracks(newTracks: List<SongItem>) {
+    private fun appendAutoQueuedTracks(
+        newTracks: List<SongItem>,
+        alreadyOrderedByService: Boolean = false
+    ) {
         if (newTracks.isEmpty()) return
         val existingIds = _queue.value.map { it.id }.toSet()
         val existingSigs = _queue.value.map { repository.songDeduplicationSignature(it) }.toSet()
@@ -2233,8 +2253,27 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                 sessionAutoQueuedIds.firstOrNull()?.let { sessionAutoQueuedIds.remove(it) }
             }
         }
-        _autoQueuedSongIds.value = _autoQueuedSongIds.value + uniqueNew.map { it.id }
-        val updatedQueue = (_queue.value + uniqueNew).distinctBy { it.id }
+        val updatedAutoIds = _autoQueuedSongIds.value + uniqueNew.map { it.id }
+        _autoQueuedSongIds.value = updatedAutoIds
+
+        val currentList = _queue.value
+        val activeId = _currentTrack.value?.id
+        val updatedQueue = if (_isShuffled.value && !alreadyOrderedByService) {
+            val activeIdx = currentList.indexOfFirst { it.id == activeId }
+            if (activeIdx >= 0 && activeIdx < currentList.lastIndex) {
+                val headUpToActive = currentList.subList(0, activeIdx + 1)
+                val afterActive = currentList.subList(activeIdx + 1, currentList.size)
+                val explicitUpcoming = afterActive.filter { it.id !in updatedAutoIds }
+                val autoUpcoming = afterActive.filter { it.id in updatedAutoIds }
+                val shuffledAutoTail = (autoUpcoming + uniqueNew).shuffled()
+                (headUpToActive + explicitUpcoming + shuffledAutoTail).distinctBy { it.id }
+            } else {
+                (currentList + uniqueNew.shuffled()).distinctBy { it.id }
+            }
+        } else {
+            (currentList + uniqueNew).distinctBy { it.id }
+        }
+
         _queue.value = updatedQueue
         PlaybackService.syncQueueFromUi(updatedQueue, _currentTrack.value)
         syncAutoQueueMetadataToService()
@@ -2323,26 +2362,33 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             customQueue.size == existingQueue.size &&
             customQueue.zip(existingQueue).all { (a, b) -> a.id == b.id }
 
-        val effectiveQueue = if (customQueue.isNotEmpty()) {
+        val rawEffectiveQueue = if (customQueue.isNotEmpty()) {
             if (customQueue.any { it.id == song.id }) customQueue else listOf(song) + customQueue
         } else {
             listOf(song)
         }
 
-        if (!isNavigatingExistingQueue) {
+        val effectiveQueue = if (!isNavigatingExistingQueue) {
             autoRadioJob?.cancel()
             _isRefillingAutoQueue.value = false
             _autoQueuedSongIds.value = emptySet()
-            if (!_isShuffled.value) {
-                unshuffledQueueBackup = emptyList()
-            }
             if (sessionAutoQueuedSignatures.size > 250) {
                 sessionAutoQueuedSignatures.clear()
                 sessionAutoQueuedIds.clear()
             }
+            if (_isShuffled.value && rawEffectiveQueue.size > 1) {
+                unshuffledQueueBackup = rawEffectiveQueue
+                listOf(song) + rawEffectiveQueue.filter { it.id != song.id }.shuffled()
+            } else {
+                if (!_isShuffled.value) {
+                    unshuffledQueueBackup = emptyList()
+                }
+                rawEffectiveQueue
+            }
         } else {
             // Once a track becomes actively played, consider it part of the active history/explicit head
             _autoQueuedSongIds.value = _autoQueuedSongIds.value - song.id
+            rawEffectiveQueue
         }
 
         sessionAutoQueuedIds.add(song.id)
@@ -2356,6 +2402,10 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         _isPlaying.value = true
         _isResolvingStream.value = true
         PlaybackService.syncQueueFromUi(effectiveQueue, song)
+        sendServiceCustomCommand(
+            PlaybackService.CMD_REFRESH_SHUFFLE_ICON,
+            Bundle().apply { putBoolean(PlaybackService.ARG_IS_SHUFFLED, _isShuffled.value) }
+        )
         syncAutoQueueMetadataToService()
         persistPlaybackSession()
 
@@ -2579,11 +2629,12 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                 return@launch
             }
             val loaded = result.getOrNull()
-            if (!isDurationRefetch || (loaded != null && loaded.lines.isNotEmpty())) {
-                _currentLyrics.value = loaded
-                _isLyricsLoading.value = false
-                updateSyncedLyricIndex(_progressMs.value)
+            val existing = _currentLyrics.value
+            if (!isDurationRefetch || (loaded != null && loaded.lines.isNotEmpty()) || existing == null) {
+                _currentLyrics.value = loaded ?: LyricsData(lines = emptyList(), isSynced = false)
             }
+            _isLyricsLoading.value = false
+            updateSyncedLyricIndex(_progressMs.value)
         }
     }
 
