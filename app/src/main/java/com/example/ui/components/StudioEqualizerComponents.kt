@@ -37,20 +37,14 @@ import androidx.compose.material.icons.automirrored.outlined.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.outlined.AutoAwesome
 import androidx.compose.material.icons.outlined.Bedtime
-import androidx.compose.material.icons.outlined.BluetoothAudio
 import androidx.compose.material.icons.outlined.GraphicEq
-import androidx.compose.material.icons.outlined.Headphones
 import androidx.compose.material.icons.outlined.Palette
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Settings
-import androidx.compose.material.icons.outlined.Speaker
 import androidx.compose.material.icons.outlined.Speed
-import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Slider
-import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
@@ -81,10 +75,11 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.model.AppThemeState
-import com.example.data.model.AudioOutputRoute
+import com.example.data.model.AudioQualitySettings
 import com.example.data.model.EqualizerBand
 import com.example.data.model.EqualizerState
 import com.example.data.model.SleepTimerState
+import com.example.data.model.StreamingQualityMode
 import com.example.data.model.StudioThemePreset
 import com.example.ui.theme.AlabasterWhite
 import com.example.ui.theme.CarbonElevated
@@ -131,15 +126,12 @@ fun StudioEqualizerConsole(
     onSetPitch: (Float) -> Unit,
     onStartSleepTimer: (Int, Boolean) -> Unit,
     onCancelSleepTimer: () -> Unit,
-    onSetCrossfadeSeconds: (Int) -> Unit = {},
-    onSetGaplessPlayback: (Boolean) -> Unit = {},
-    onSetAutoQueueRadio: (Boolean) -> Unit = {},
-    onSetAutoDeviceProfilesEnabled: (Boolean) -> Unit = {},
-    onSetOutputRoutePreset: (AudioOutputRoute, String) -> Unit = { _, _ -> },
     themeState: AppThemeState = AppThemeState(),
     onSelectThemePreset: (StudioThemePreset) -> Unit = {},
     onSetAmoledPureBlack: (Boolean) -> Unit = {},
     onSetDynamicArtworkTint: (Boolean) -> Unit = {},
+    audioQualitySettings: AudioQualitySettings = AudioQualitySettings(),
+    onSelectStreamingQualityMode: (StreamingQualityMode) -> Unit = {},
     selectedTasteGenres: List<String> = emptyList(),
     onOpenTasteEditor: () -> Unit = {},
     modifier: Modifier = Modifier
@@ -189,6 +181,14 @@ fun StudioEqualizerConsole(
                     onSelectThemePreset = onSelectThemePreset,
                     onSetAmoledPureBlack = onSetAmoledPureBlack,
                     onSetDynamicArtworkTint = onSetDynamicArtworkTint
+                )
+            }
+
+            // 0.5 Compact Audio Quality Card (Auto, High Quality, Data Saver)
+            item(key = "studio_audio_quality_data_saver") {
+                AudioQualityAndDataSaverCard(
+                    settings = audioQualitySettings,
+                    onSelectQualityMode = onSelectStreamingQualityMode
                 )
             }
 
@@ -436,284 +436,7 @@ fun StudioEqualizerConsole(
                 }
             }
 
-            // 4. Playback Transitions & Endless Auto-Queue Radio Console
-            item(key = "studio_playback_transitions_card") {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(22.dp))
-                        .background(CarbonSurface)
-                        .border(0.75.dp, SubtleBorder.copy(alpha = 0.75f), RoundedCornerShape(22.dp))
-                        .padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(14.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Outlined.Tune,
-                                contentDescription = null,
-                                tint = ElectricMint,
-                                modifier = Modifier.size(18.dp)
-                            )
-                            Text(
-                                text = "CROSSFADE & PLAYBACK",
-                                style = MaterialTheme.typography.labelSmall.copy(
-                                    fontFamily = JetBrainsMonoFontFamily,
-                                    fontWeight = FontWeight.Bold,
-                                    letterSpacing = 1.sp
-                                ),
-                                color = AlabasterWhite
-                            )
-                        }
-
-                        Surface(
-                            color = if (equalizerState.crossfadeSeconds > 0) ElectricMint.copy(alpha = 0.14f) else CarbonElevated,
-                            shape = RoundedCornerShape(50),
-                            modifier = Modifier.border(
-                                width = 0.5.dp,
-                                color = if (equalizerState.crossfadeSeconds > 0) ElectricMint.copy(alpha = 0.45f) else SubtleBorder,
-                                shape = RoundedCornerShape(50)
-                            )
-                        ) {
-                            Text(
-                                text = if (equalizerState.crossfadeSeconds == 0) "OFF" else "${equalizerState.crossfadeSeconds}s CROSSFADE",
-                                style = MaterialTheme.typography.labelSmall.copy(
-                                    fontFamily = JetBrainsMonoFontFamily,
-                                    fontWeight = FontWeight.Bold,
-                                    fontSize = 10.sp
-                                ),
-                                color = if (equalizerState.crossfadeSeconds > 0) ElectricMint else MutedSlate,
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
-                            )
-                        }
-                    }
-
-                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = "Track Crossfade Transition",
-                                style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
-                                color = AlabasterWhite
-                            )
-                            Text(
-                                text = "0s .. 12s",
-                                style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFontFamily),
-                                color = MutedSlate
-                            )
-                        }
-                        Slider(
-                            value = equalizerState.crossfadeSeconds.toFloat(),
-                            onValueChange = { onSetCrossfadeSeconds(it.roundToInt()) },
-                            valueRange = 0f..12f,
-                            steps = 11,
-                            colors = SliderDefaults.colors(
-                                thumbColor = ElectricMint,
-                                activeTrackColor = ElectricMint,
-                                inactiveTrackColor = CarbonElevated
-                            ),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .testTag("crossfade_duration_slider")
-                        )
-                    }
-
-                    // Gapless Playback Toggle
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
-                            Text(
-                                text = "Gapless Playback",
-                                style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
-                                color = AlabasterWhite
-                            )
-                            Text(
-                                text = "Eliminates silence between consecutive album & playlist tracks",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MutedSlate
-                            )
-                        }
-                        Switch(
-                            checked = equalizerState.gaplessPlayback,
-                            onCheckedChange = onSetGaplessPlayback,
-                            colors = SwitchDefaults.colors(
-                                checkedThumbColor = ThemeOnPrimary,
-                                checkedTrackColor = ElectricMint,
-                                uncheckedThumbColor = MutedSlate,
-                                uncheckedTrackColor = CarbonElevated,
-                                uncheckedBorderColor = SubtleBorder
-                            ),
-                            modifier = Modifier.testTag("gapless_playback_switch")
-                        )
-                    }
-                }
-            }
-
-            // 5. Audio Output Device Auto-Profiles (Speaker / Wired Headphones / Bluetooth)
-            item(key = "studio_output_device_profiles_card") {
-                val routeRows = listOf(
-                    Triple(AudioOutputRoute.SPEAKER, Icons.Outlined.Speaker, equalizerState.speakerPreset),
-                    Triple(AudioOutputRoute.WIRED_HEADPHONES, Icons.Outlined.Headphones, equalizerState.wiredPreset),
-                    Triple(AudioOutputRoute.BLUETOOTH, Icons.Outlined.BluetoothAudio, equalizerState.bluetoothPreset)
-                )
-
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(22.dp))
-                        .background(CarbonSurface)
-                        .border(0.75.dp, SubtleBorder.copy(alpha = 0.75f), RoundedCornerShape(22.dp))
-                        .padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(
-                            modifier = Modifier.weight(1f).padding(end = 10.dp),
-                            verticalArrangement = Arrangement.spacedBy(3.dp)
-                        ) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                Icon(
-                                    imageVector = when (equalizerState.activeOutputRoute) {
-                                        AudioOutputRoute.BLUETOOTH -> Icons.Outlined.BluetoothAudio
-                                        AudioOutputRoute.WIRED_HEADPHONES -> Icons.Outlined.Headphones
-                                        AudioOutputRoute.SPEAKER -> Icons.Outlined.Speaker
-                                    },
-                                    contentDescription = null,
-                                    tint = CyberCyan,
-                                    modifier = Modifier.size(18.dp)
-                                )
-                                Text(
-                                    text = "OUTPUT DEVICE AUTO-PROFILES",
-                                    style = MaterialTheme.typography.labelSmall.copy(
-                                        fontFamily = JetBrainsMonoFontFamily,
-                                        fontWeight = FontWeight.Bold,
-                                        letterSpacing = 1.sp
-                                    ),
-                                    color = AlabasterWhite
-                                )
-                            }
-                            Text(
-                                text = "Active: ${equalizerState.activeOutputRoute.label} • Auto-switches EQ on plug/pair",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = CyberCyan.copy(alpha = 0.9f),
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                        }
-
-                        Switch(
-                            checked = equalizerState.autoDeviceProfilesEnabled,
-                            onCheckedChange = onSetAutoDeviceProfilesEnabled,
-                            colors = SwitchDefaults.colors(
-                                checkedThumbColor = ThemeOnPrimary,
-                                checkedTrackColor = ElectricMint,
-                                uncheckedThumbColor = MutedSlate,
-                                uncheckedTrackColor = CarbonElevated,
-                                uncheckedBorderColor = SubtleBorder
-                            ),
-                            modifier = Modifier.testTag("auto_device_profiles_switch")
-                        )
-                    }
-
-                    routeRows.forEach { (route, routeIcon, selectedPreset) ->
-                        val isActiveRoute = equalizerState.activeOutputRoute == route
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(14.dp))
-                                .background(
-                                    if (isActiveRoute) CyberCyan.copy(alpha = 0.09f) else CarbonElevated.copy(alpha = 0.65f)
-                                )
-                                .border(
-                                    width = if (isActiveRoute) 0.9.dp else 0.5.dp,
-                                    color = if (isActiveRoute) CyberCyan.copy(alpha = 0.55f) else SubtleBorder.copy(alpha = 0.6f),
-                                    shape = RoundedCornerShape(14.dp)
-                                )
-                                .clickable {
-                                    val currentIdx = eqPresets.indexOfFirst { it.equals(selectedPreset, ignoreCase = true) }
-                                    val nextPreset = eqPresets[(currentIdx + 1) % eqPresets.size]
-                                    onSetOutputRoutePreset(route, nextPreset)
-                                }
-                                .padding(horizontal = 12.dp, vertical = 12.dp)
-                                .testTag("device_profile_row_${route.key}"),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(10.dp),
-                                modifier = Modifier.weight(1f)
-                            ) {
-                                Icon(
-                                    imageVector = routeIcon,
-                                    contentDescription = route.label,
-                                    tint = if (isActiveRoute) CyberCyan else MutedSlate,
-                                    modifier = Modifier.size(19.dp)
-                                )
-                                Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
-                                    Text(
-                                        text = route.label,
-                                        style = MaterialTheme.typography.titleSmall.copy(
-                                            fontWeight = if (isActiveRoute) FontWeight.Bold else FontWeight.Medium
-                                        ),
-                                        color = AlabasterWhite,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
-                                    Text(
-                                        text = if (isActiveRoute) "Connected now • Tap to cycle preset" else "Tap to cycle EQ preset",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = if (isActiveRoute) CyberCyan else MutedSlate,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
-                                }
-                            }
-
-                            Surface(
-                                color = if (isActiveRoute) ElectricMint.copy(alpha = 0.16f) else CarbonElevated,
-                                shape = RoundedCornerShape(50),
-                                modifier = Modifier.border(
-                                    width = 0.6.dp,
-                                    color = if (isActiveRoute) ElectricMint.copy(alpha = 0.55f) else SubtleBorder,
-                                    shape = RoundedCornerShape(50)
-                                )
-                            ) {
-                                Text(
-                                    text = selectedPreset,
-                                    style = MaterialTheme.typography.labelMedium.copy(
-                                        fontWeight = FontWeight.Bold
-                                    ),
-                                    color = if (isActiveRoute) ElectricMint else AlabasterWhite,
-                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-
-            // 6. Personalize Music Taste Card (Re-open 2-step Genre & Artist Editor anytime)
+            // 4. Personalize Music Taste Card (Re-open 2-step Genre & Artist Editor anytime)
             item(key = "studio_music_taste_profile_card") {
                 Surface(
                     color = CarbonSurface,

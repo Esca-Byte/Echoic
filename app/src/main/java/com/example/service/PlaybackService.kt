@@ -3,14 +3,11 @@ package com.example.service
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
-import android.media.AudioDeviceCallback
-import android.media.AudioDeviceInfo
-import android.media.AudioManager
 import android.media.audiofx.BassBoost
 import android.media.audiofx.Equalizer
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import androidx.annotation.OptIn
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
@@ -42,7 +39,6 @@ import com.example.MainActivity
 import com.example.R
 import com.example.data.local.MusicDatabase
 import com.example.data.local.PlaybackSessionStore
-import com.example.data.model.AudioOutputRoute
 import com.example.data.model.PlayerRepeatMode
 import com.example.data.model.SongItem
 import com.example.data.repository.MusicRepository
@@ -93,12 +89,12 @@ class PlaybackService : MediaSessionService() {
     }
     private var savedBassBoostStrength: Short = 250
 
-    private var crossfadeSeconds: Int = 4
+    private var crossfadeSeconds: Int = 0
     private var gaplessPlaybackEnabled: Boolean = true
     private var isServiceShuffled: Boolean = false
+    private var serviceRepeatMode: PlayerRepeatMode = PlayerRepeatMode.OFF
 
-    private var audioManager: AudioManager? = null
-    private var audioDeviceCallback: AudioDeviceCallback? = null
+    private var transitionWakeLock: PowerManager.WakeLock? = null
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var fadeOutJob: Job? = null
@@ -130,15 +126,18 @@ class PlaybackService : MediaSessionService() {
             }
         }
         savedBassBoostStrength = savedAudio.bassBoostStrength.toShort()
-        crossfadeSeconds = savedAudio.crossfadeSeconds
-        gaplessPlaybackEnabled = savedAudio.gaplessPlayback
+        crossfadeSeconds = 0
+        gaplessPlaybackEnabled = true
 
-        // Restore persisted queue/session if service started fresh (e.g. from widget)
+        // Restore persisted queue/session if service started fresh (e.g. from widget or notification)
         if (activeServiceSong == null && serviceQueue.isEmpty()) {
             PlaybackSessionStore.loadSession(applicationContext)?.let { session ->
                 activeServiceSong = session.currentTrack
                 serviceQueue = session.queue
                 isServiceShuffled = session.isShuffled
+                serviceRepeatMode = runCatching {
+                    PlayerRepeatMode.valueOf(session.repeatModeName)
+                }.getOrDefault(PlayerRepeatMode.OFF)
             }
         }
 
@@ -254,17 +253,16 @@ class PlaybackService : MediaSessionService() {
                         }
                         return
                     }
-                    if (activeCrossfadeJob?.isActive == true) {
-                        // Active crossfade loop watches STATE_ENDED and completes the handoff immediately;
-                        // its finally block falls back to handleBackgroundSkipNext if handoff didn't run.
+                    if (activeCrossfadeJob?.isActive == true || backgroundSkipJob?.isActive == true) {
+                        // Track transition is already actively running
                         return
                     }
-                    if (player.repeatMode == Player.REPEAT_MODE_ONE) {
+                    if (serviceRepeatMode == PlayerRepeatMode.ONE || player.repeatMode == Player.REPEAT_MODE_ONE) {
                         player.seekTo(0L)
                         player.playWhenReady = true
                         player.play()
                     } else {
-                        // Autonomous background auto-advance (foreground or screen-off)
+                        // Autonomous background auto-advance (foreground, background, or screen-off)
                         handleBackgroundSkipNext(autoTriggered = true)
                     }
                 }
@@ -273,41 +271,51 @@ class PlaybackService : MediaSessionService() {
             override fun onPlayerError(error: PlaybackException) {
                 cancelActiveCrossfade()
                 val activeSong = activeServiceSong ?: extractSongFromMediaItem(player.currentMediaItem) ?: return
-                serviceScope.launch {
-                    val alternateUrl = withContext(Dispatchers.IO) {
-                        repository.getAlternateStreamUrl(activeSong, activeSong.streamUrl)
-                    }
-                    if (!alternateUrl.isNullOrBlank()) {
-                        serviceConsecutiveFailures = 0
-                        val recoveredSong = activeSong.copy(streamUrl = alternateUrl)
-                        activeServiceSong = recoveredSong
-                        replaceSongInServiceQueue(recoveredSong)
-                        player.stop()
-                        player.clearMediaItems()
-                        player.setMediaItem(buildMediaItemForSong(recoveredSong))
-                        player.playWhenReady = true
-                        player.prepare()
-                        player.play()
-                        MiniPlayerWidgetProvider.syncWidget(applicationContext, recoveredSong, true)
-                        _serviceEvents.emit(ServicePlaybackEvent.TrackTransitioned(recoveredSong))
-                    } else {
-                        serviceConsecutiveFailures++
-                        if (serviceConsecutiveFailures < 3 && serviceQueue.size > 1) {
-                            handleBackgroundSkipNext(autoTriggered = true)
-                        } else {
-                            MiniPlayerWidgetProvider.syncWidget(applicationContext, activeSong, false)
-                            _serviceEvents.emit(ServicePlaybackEvent.StreamUnavailable(activeSong))
+                val failedUrl = activeSong.streamUrl
+                repository.invalidateStreamUrl(activeSong.id, failedUrl)
+                replaceSongInServiceQueue(activeSong.copy(streamUrl = ""))
+                acquireTransitionWakeLock()
+
+                val seq = servicePlaySeq.incrementAndGet()
+                backgroundSkipJob?.cancel()
+                backgroundSkipJob = serviceScope.launch {
+                    try {
+                        val alternateUrl = withContext(Dispatchers.IO) {
+                            repository.getAlternateStreamUrl(activeSong, failedUrl)
                         }
+                        if (seq != servicePlaySeq.get()) return@launch
+                        if (!alternateUrl.isNullOrBlank()) {
+                            serviceConsecutiveFailures = 0
+                            val recoveredSong = activeSong.copy(streamUrl = alternateUrl)
+                            activeServiceSong = recoveredSong
+                            replaceSongInServiceQueue(recoveredSong)
+                            playMediaItemAtomically(recoveredSong)
+                            MiniPlayerWidgetProvider.syncWidget(applicationContext, recoveredSong, true)
+                            persistServiceSessionSnapshot()
+                            _serviceEvents.emit(ServicePlaybackEvent.TrackTransitioned(recoveredSong))
+                            scheduleLookaheadPreResolve(recoveredSong)
+                        } else {
+                            serviceConsecutiveFailures++
+                            if (serviceConsecutiveFailures < 5 && (serviceQueue.size > 1 || autoQueueEnabled)) {
+                                handleBackgroundSkipNext(autoTriggered = true)
+                            } else {
+                                MiniPlayerWidgetProvider.syncWidget(applicationContext, activeSong, false)
+                                _serviceEvents.emit(ServicePlaybackEvent.StreamUnavailable(activeSong))
+                            }
+                        }
+                    } finally {
+                        releaseTransitionWakeLock()
                     }
                 }
             }
         })
 
+        applyExoPlayerRepeatMode()
+
         if (player.audioSessionId != C.AUDIO_SESSION_ID_UNSET) {
             attachHardwareAudioEffects(player.audioSessionId)
         }
 
-        registerAudioDeviceMonitor()
         startTransitionMonitorLoop()
 
         // 4. Wrap ExoPlayer in SpiralForwardingPlayer so Lock Screen, Notification,
@@ -344,83 +352,68 @@ class PlaybackService : MediaSessionService() {
         setMediaNotificationProvider(notificationProvider)
     }
 
-    private fun registerAudioDeviceMonitor() {
-        val manager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
-        audioManager = manager
-        currentOutputRoute = detectCurrentAudioOutputRoute(applicationContext)
-
-        val callback = object : AudioDeviceCallback() {
-            override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
-                handleAudioOutputTopologyChanged()
-            }
-
-            override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>?) {
-                handleAudioOutputTopologyChanged()
-            }
-        }
-        audioDeviceCallback = callback
-        manager.registerAudioDeviceCallback(callback, null)
+    private fun isTrackTransitionInFlight(): Boolean {
+        return backgroundSkipJob?.isActive == true || activeCrossfadeJob?.isActive == true
     }
 
-    private fun handleAudioOutputTopologyChanged() {
-        val detected = detectCurrentAudioOutputRoute(applicationContext)
-        if (detected != currentOutputRoute) {
-            currentOutputRoute = detected
-            serviceScope.launch {
-                val audioSettings = PlaybackSessionStore.loadAudioSettings(applicationContext)
-                if (audioSettings.autoDeviceProfilesEnabled) {
-                    val presetForRoute = when (detected) {
-                        AudioOutputRoute.SPEAKER -> audioSettings.speakerPreset
-                        AudioOutputRoute.WIRED_HEADPHONES -> audioSettings.wiredPreset
-                        AudioOutputRoute.BLUETOOTH -> audioSettings.bluetoothPreset
-                    }
-                    applyHardwarePresetDirectly(presetForRoute)
-                }
-                _serviceEvents.emit(ServicePlaybackEvent.AudioRouteChanged(detected))
+    private fun acquireTransitionWakeLock(timeoutMs: Long = 25_000L) {
+        runCatching {
+            val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return
+            val wl = transitionWakeLock ?: pm.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                "Echoic:PlaybackTransitionWakeLock"
+            ).apply {
+                setReferenceCounted(false)
+                transitionWakeLock = this
             }
+            wl.acquire(timeoutMs)
         }
     }
 
-    private fun applyHardwarePresetDirectly(presetName: String) {
-        val presetLevels: List<Short> = when (presetName) {
-            "Flat" -> listOf(0, 0, 0, 0, 0)
-            "Bass Boost", "Bass Heavy" -> listOf(950, 680, 100, 150, 250)
-            "Desi Bass" -> listOf(1050, 720, -50, 350, 500)
-            "Vocal Clarity", "Vocal Boost" -> listOf(-200, 150, 750, 650, 200)
-            "Treble Sparkle", "Electronic" -> listOf(650, 300, -100, 500, 900)
-            "Late Night" -> listOf(450, 200, -100, 250, -200)
-            else -> listOf(300, 150, 0, 200, 350)
+    private fun releaseTransitionWakeLock() {
+        runCatching {
+            transitionWakeLock?.let { if (it.isHeld) it.release() }
         }
-        val bassStrength = when (presetName) {
-            "Flat" -> 0
-            "Bass Boost", "Bass Heavy" -> 780
-            "Desi Bass" -> 850
-            "Treble Sparkle", "Electronic" -> 520
-            "Vocal Clarity", "Vocal Boost" -> 150
-            "Late Night" -> 350
-            else -> 300
-        }.toShort()
+    }
 
-        for (i in 0 until savedBandLevelsMb.size) {
-            savedBandLevelsMb[i] = presetLevels.getOrElse(i) { 0 }
+    /**
+     * Atomically swaps the active MediaItem on ExoPlayer WITHOUT calling player.stop() or player.clearMediaItems().
+     * This prevents MediaSessionService from seeing mediaItemCount == 0 and dismissing the notification panel.
+     */
+    private fun playMediaItemAtomically(song: SongItem, startPositionMs: Long = 0L) {
+        if (!::player.isInitialized) return
+        player.volume = 1.0f
+        val item = buildMediaItemForSong(song)
+        player.setMediaItem(item, startPositionMs.coerceAtLeast(0L))
+        player.playWhenReady = true
+        player.prepare()
+        player.play()
+    }
+
+    private fun applyExoPlayerRepeatMode() {
+        if (!::player.isInitialized) return
+        // Only REPEAT_MODE_ONE is delegated to ExoPlayer natively; REPEAT_MODE_ALL is managed over the full
+        // serviceQueue so a 1-2 item ExoPlayer timeline never loops on a single track.
+        player.repeatMode = if (serviceRepeatMode == PlayerRepeatMode.ONE) {
+            Player.REPEAT_MODE_ONE
+        } else {
+            Player.REPEAT_MODE_OFF
         }
-        savedBassBoostStrength = bassStrength
+    }
 
-        if (isEqEnabled) {
-            runCatching {
-                equalizer?.let { eq ->
-                    val count = eq.numberOfBands.toInt().coerceAtMost(savedBandLevelsMb.size)
-                    for (i in 0 until count) {
-                        eq.setBandLevel(i.toShort(), savedBandLevelsMb[i])
-                    }
+    private fun ensureQueueLoadedFromStorage() {
+        if (serviceQueue.isEmpty() || activeServiceSong == null) {
+            PlaybackSessionStore.loadSession(applicationContext)?.let { saved ->
+                if (serviceQueue.isEmpty() && saved.queue.isNotEmpty()) {
+                    serviceQueue = saved.queue
                 }
-            }
-            runCatching {
-                bassBoost?.let { bb ->
-                    if (bb.strengthSupported) {
-                        bb.setStrength(savedBassBoostStrength)
-                    }
+                if (activeServiceSong == null && saved.currentTrack != null) {
+                    activeServiceSong = saved.currentTrack
                 }
+                isServiceShuffled = saved.isShuffled
+                serviceRepeatMode = runCatching {
+                    PlayerRepeatMode.valueOf(saved.repeatModeName)
+                }.getOrDefault(serviceRepeatMode)
             }
         }
     }
@@ -433,7 +426,20 @@ class PlaybackService : MediaSessionService() {
             .setAudioAttributes(audioAttributes, /* handleAudioFocus = */ false)
             .setWakeMode(C.WAKE_MODE_NETWORK)
             .build()
-            .also { crossfadePlayer = it }
+            .also { cf ->
+                cf.addListener(object : Player.Listener {
+                    override fun onPlayerError(error: PlaybackException) {
+                        val failedId = preparedCrossfadeSongId
+                        val failedUrl = preparedCrossfadeUrl
+                        if (!failedId.isNullOrBlank()) {
+                            repository.invalidateStreamUrl(failedId, failedUrl.orEmpty())
+                        }
+                        preparedCrossfadeSongId = null
+                        preparedCrossfadeUrl = null
+                    }
+                })
+                crossfadePlayer = cf
+            }
     }
 
     private fun cancelActiveCrossfade() {
@@ -456,7 +462,8 @@ class PlaybackService : MediaSessionService() {
      * Monitors playback progress inside PlaybackService to drive:
      * 1. Pre-buffering of the next song when Crossfade is enabled
      * 2. Equal-power dual-player audio crossfade overlap
-     * 3. Periodic session state checkpointing for "Resume Where You Left Off"
+     * 3. Watchdog recovery if ExoPlayer ever rests in STATE_ENDED without advancing
+     * 4. Periodic session state checkpointing for "Resume Where You Left Off"
      */
     private fun startTransitionMonitorLoop() {
         transitionMonitorJob?.cancel()
@@ -468,18 +475,34 @@ class PlaybackService : MediaSessionService() {
                 val playing = player.isPlaying
                 val activeSong = activeServiceSong ?: extractSongFromMediaItem(player.currentMediaItem)
 
+                // Safety watchdog: never allow a finished track to sit stuck/paused in STATE_ENDED
+                if (player.playbackState == Player.STATE_ENDED &&
+                    !stopAfterCurrentTrackFlag &&
+                    !isTrackTransitionInFlight() &&
+                    activeSong != null
+                ) {
+                    if (serviceRepeatMode == PlayerRepeatMode.ONE) {
+                        player.seekTo(0L)
+                        player.playWhenReady = true
+                        player.play()
+                    } else {
+                        handleBackgroundSkipNext(autoTriggered = true)
+                    }
+                    continue
+                }
+
                 if (playing && activeSong != null) {
                     tickCounter++
                     if (tickCounter % 16 == 0) { // ~every 4 seconds
                         persistServiceSessionSnapshot()
                     }
 
-                    // Proactively replenish upcoming queue inside service so Crossfade & Gapless always have next track ready
+                    // Proactively replenish upcoming queue inside service so Crossfade & Gapless always have next tracks ready
                     val queueSnapshot = serviceQueue
                     val curIdx = queueSnapshot.indexOfFirst { it.id == activeSong.id }
                     val remainingAhead = if (curIdx >= 0) (queueSnapshot.lastIndex - curIdx) else queueSnapshot.lastIndex
                     if (autoQueueEnabled &&
-                        player.repeatMode == Player.REPEAT_MODE_OFF &&
+                        serviceRepeatMode == PlayerRepeatMode.OFF &&
                         remainingAhead < 4 &&
                         backgroundAutoQueueJob?.isActive != true
                     ) {
@@ -494,9 +517,10 @@ class PlaybackService : MediaSessionService() {
                     val currentPos = player.currentPosition.coerceAtLeast(0L)
                     if (cfSec > 0 &&
                         totalDur > 25_000L &&
-                        player.repeatMode != Player.REPEAT_MODE_ONE &&
+                        serviceRepeatMode != PlayerRepeatMode.ONE &&
                         !stopAfterCurrentTrackFlag &&
                         activeCrossfadeJob?.isActive != true &&
+                        backgroundSkipJob?.isActive != true &&
                         crossfadeTriggeredTrackId != activeSong.id
                     ) {
                         val remainingMs = totalDur - currentPos
@@ -530,7 +554,7 @@ class PlaybackService : MediaSessionService() {
         if (queueSnapshot.size <= 1) return null
         val currentIdx = queueSnapshot.indexOfFirst { it.id == currentId }
         if (currentIdx < 0) return queueSnapshot.firstOrNull()
-        if (currentIdx >= queueSnapshot.lastIndex && player.repeatMode == Player.REPEAT_MODE_OFF) {
+        if (currentIdx >= queueSnapshot.lastIndex && serviceRepeatMode == PlayerRepeatMode.OFF) {
             return null
         }
         val nextIdx = (currentIdx + 1) % queueSnapshot.size
@@ -541,38 +565,48 @@ class PlaybackService : MediaSessionService() {
         preparedCrossfadeSongId = nextSong.id
         serviceScope.launch {
             val resolvedUrl = withContext(Dispatchers.IO) {
-                if (repository.isFullLengthStreamUrl(nextSong.streamUrl)) {
-                    nextSong.streamUrl
-                } else {
-                    repository.getStreamUrl(
-                        videoId = nextSong.id,
-                        trackTitle = nextSong.title,
-                        artistName = nextSong.artist
-                    ).getOrDefault("")
+                val localUri = repository.getOfflineLocalFileUri(nextSong.id)
+                when {
+                    !localUri.isNullOrBlank() -> localUri
+                    repository.isFullLengthStreamUrl(nextSong.streamUrl) -> nextSong.streamUrl
+                    else -> repository.getCachedValidStreamUrl(nextSong.id)
+                        ?: repository.getStreamUrl(
+                            videoId = nextSong.id,
+                            trackTitle = nextSong.title,
+                            artistName = nextSong.artist
+                        ).getOrDefault("")
                 }
             }
-            if (resolvedUrl.isBlank() || preparedCrossfadeSongId != nextSong.id) return@launch
+            if (resolvedUrl.isBlank() || preparedCrossfadeSongId != nextSong.id) {
+                if (preparedCrossfadeSongId == nextSong.id) {
+                    preparedCrossfadeSongId = null
+                    preparedCrossfadeUrl = null
+                }
+                return@launch
+            }
             val updatedNext = nextSong.copy(streamUrl = resolvedUrl)
             preparedCrossfadeUrl = resolvedUrl
             replaceSongInServiceQueue(updatedNext)
 
             val cfPlayer = getOrCreateCrossfadePlayer()
-            cfPlayer.stop()
-            cfPlayer.clearMediaItems()
             cfPlayer.volume = 0f
             cfPlayer.playWhenReady = false
-            cfPlayer.setMediaItem(buildMediaItemForSong(updatedNext))
+            cfPlayer.setMediaItem(buildMediaItemForSong(updatedNext), 0L)
             cfPlayer.prepare()
         }
     }
 
     private fun launchDualPlayerCrossfade(incomingSong: SongItem, fadeDurationMs: Long) {
         activeCrossfadeJob?.cancel()
+        acquireTransitionWakeLock()
         activeCrossfadeJob = serviceScope.launch {
             var handoffCompleted = false
             var userPausedDuringFade = false
             try {
-                val resolvedUrl = if (preparedCrossfadeSongId == incomingSong.id && !preparedCrossfadeUrl.isNullOrBlank()) {
+                val resolvedUrl = if (preparedCrossfadeSongId == incomingSong.id &&
+                    !preparedCrossfadeUrl.isNullOrBlank() &&
+                    repository.isFullLengthStreamUrl(preparedCrossfadeUrl!!)
+                ) {
                     preparedCrossfadeUrl!!
                 } else {
                     withContext(Dispatchers.IO) {
@@ -580,11 +614,12 @@ class PlaybackService : MediaSessionService() {
                         when {
                             !localUri.isNullOrBlank() -> localUri
                             repository.isFullLengthStreamUrl(incomingSong.streamUrl) -> incomingSong.streamUrl
-                            else -> repository.getStreamUrl(
-                                videoId = incomingSong.id,
-                                trackTitle = incomingSong.title,
-                                artistName = incomingSong.artist
-                            ).getOrDefault("")
+                            else -> repository.getCachedValidStreamUrl(incomingSong.id)
+                                ?: repository.getStreamUrl(
+                                    videoId = incomingSong.id,
+                                    trackTitle = incomingSong.title,
+                                    artistName = incomingSong.artist
+                                ).getOrDefault("")
                         }
                     }
                 }
@@ -597,42 +632,63 @@ class PlaybackService : MediaSessionService() {
                 replaceSongInServiceQueue(updatedNext)
 
                 val cfPlayer = getOrCreateCrossfadePlayer()
-                if (preparedCrossfadeSongId != updatedNext.id || cfPlayer.mediaItemCount == 0) {
-                    cfPlayer.stop()
-                    cfPlayer.clearMediaItems()
-                    cfPlayer.setMediaItem(buildMediaItemForSong(updatedNext))
+                if (preparedCrossfadeSongId != updatedNext.id || cfPlayer.mediaItemCount == 0 || cfPlayer.playerError != null) {
+                    cfPlayer.setMediaItem(buildMediaItemForSong(updatedNext), 0L)
                     cfPlayer.prepare()
                 }
-                cfPlayer.volume = 0.02f
-                cfPlayer.play()
 
-                val stepMs = 40L
-                val steps = (fadeDurationMs / stepMs).toInt().coerceIn(12, 240)
-                for (step in 1..steps) {
-                    if (!isActive) return@launch
-                    if (!player.playWhenReady || stopAfterCurrentTrackFlag) {
-                        userPausedDuringFade = true
-                        cfPlayer.pause()
-                        player.volume = 1.0f
-                        return@launch
-                    }
-                    // If the outgoing primary track finishes early while fading, break straight into handoff
-                    if (player.playbackState == Player.STATE_ENDED ||
-                        player.playbackState == Player.STATE_IDLE ||
-                        !player.isPlaying
-                    ) {
-                        break
-                    }
-                    val t = step.toFloat() / steps.toFloat()
-                    // Equal-power fade curve avoids volume dip in the middle of overlap
-                    val outgoingVol = cos(t * (PI / 2.0)).toFloat().coerceIn(0f, 1f)
-                    val incomingVol = sin(t * (PI / 2.0)).toFloat().coerceIn(0f, 1f)
-                    player.volume = outgoingVol
-                    cfPlayer.volume = incomingVol
-                    delay(stepMs)
+                // Wait briefly (up to 600ms) for cfPlayer to be buffered before fading outgoing track down
+                var waitMs = 0L
+                while (isActive &&
+                    cfPlayer.playbackState == Player.STATE_BUFFERING &&
+                    cfPlayer.playerError == null &&
+                    waitMs < 600L &&
+                    player.playbackState != Player.STATE_ENDED
+                ) {
+                    delay(40L)
+                    waitMs += 40L
                 }
 
-                val handoffPosMs = cfPlayer.currentPosition.coerceAtLeast(0L)
+                val canOverlapFade = cfPlayer.playbackState == Player.STATE_READY &&
+                    cfPlayer.playerError == null &&
+                    player.isPlaying
+
+                if (canOverlapFade) {
+                    cfPlayer.volume = 0.02f
+                    cfPlayer.play()
+
+                    val stepMs = 40L
+                    val steps = (fadeDurationMs / stepMs).toInt().coerceIn(10, 240)
+                    for (step in 1..steps) {
+                        if (!isActive) return@launch
+                        if (!player.playWhenReady || stopAfterCurrentTrackFlag) {
+                            userPausedDuringFade = true
+                            cfPlayer.pause()
+                            player.volume = 1.0f
+                            return@launch
+                        }
+                        if (player.playbackState == Player.STATE_ENDED ||
+                            player.playbackState == Player.STATE_IDLE ||
+                            !player.isPlaying ||
+                            cfPlayer.playerError != null
+                        ) {
+                            break
+                        }
+                        val t = step.toFloat() / steps.toFloat()
+                        // Equal-power fade curve avoids volume dip in the middle of overlap
+                        val outgoingVol = cos(t * (PI / 2.0)).toFloat().coerceIn(0f, 1f)
+                        val incomingVol = sin(t * (PI / 2.0)).toFloat().coerceIn(0f, 1f)
+                        player.volume = outgoingVol
+                        cfPlayer.volume = incomingVol
+                        delay(stepMs)
+                    }
+                }
+
+                val handoffPosMs = if (canOverlapFade && cfPlayer.playerError == null) {
+                    cfPlayer.currentPosition.coerceAtLeast(0L)
+                } else {
+                    0L
+                }
                 cfPlayer.pause()
                 cfPlayer.stop()
                 cfPlayer.clearMediaItems()
@@ -640,19 +696,13 @@ class PlaybackService : MediaSessionService() {
                 preparedCrossfadeSongId = null
                 preparedCrossfadeUrl = null
 
-                // Seamlessly hand playback to primary MediaSession player at exact crossfaded offset
+                // Atomically hand playback to primary MediaSession player WITHOUT clearing items
                 serviceConsecutiveFailures = 0
                 activeServiceSong = updatedNext
-                player.stop()
-                player.clearMediaItems()
-                player.setMediaItem(buildMediaItemForSong(updatedNext))
-                if (handoffPosMs > 200L) {
-                    player.seekTo(handoffPosMs)
-                }
-                player.volume = 1.0f
-                player.playWhenReady = true
-                player.prepare()
-                player.play()
+                playMediaItemAtomically(
+                    song = updatedNext,
+                    startPositionMs = if (handoffPosMs > 200L) handoffPosMs else 0L
+                )
                 handoffCompleted = true
 
                 updateNotificationActionButtons(
@@ -664,6 +714,7 @@ class PlaybackService : MediaSessionService() {
                 _serviceEvents.emit(ServicePlaybackEvent.TrackTransitioned(updatedNext))
                 scheduleLookaheadPreResolve(updatedNext)
             } finally {
+                releaseTransitionWakeLock()
                 if (!handoffCompleted) {
                     if (::player.isInitialized && fadeOutJob?.isActive != true) {
                         player.volume = 1.0f
@@ -776,6 +827,20 @@ class PlaybackService : MediaSessionService() {
 
         override fun hasPreviousMediaItem(): Boolean = true
 
+        override fun play() {
+            if (mediaItemCount == 0) {
+                ensureQueueLoadedFromStorage()
+                val targetSong = activeServiceSong ?: serviceQueue.firstOrNull()
+                if (targetSong != null) {
+                    val savedSession = PlaybackSessionStore.loadSession(applicationContext)
+                    val resumePos = savedSession?.takeIf { it.currentTrack?.id == targetSong.id }?.progressMs ?: 0L
+                    resolveAndPlayInService(targetSong, startPositionMs = resumePos)
+                    return
+                }
+            }
+            super.play()
+        }
+
         override fun seekToNext() {
             handleBackgroundSkipNext(autoTriggered = false)
         }
@@ -803,13 +868,14 @@ class PlaybackService : MediaSessionService() {
 
     /**
      * Resolves and plays the next song in [serviceQueue] directly inside [PlaybackService]
-     * so background auto-advance and lock-screen/Bluetooth Next work even when the screen is off.
+     * so background auto-advance and lock-screen/Bluetooth/Notification Next work reliably even when the app is closed or paused.
      */
     private fun handleBackgroundSkipNext(autoTriggered: Boolean) {
         cancelActiveCrossfade()
         if (!autoTriggered) {
             serviceConsecutiveFailures = 0
         }
+        ensureQueueLoadedFromStorage()
         val queueSnapshot = serviceQueue.ifEmpty {
             listOfNotNull(activeServiceSong)
         }
@@ -819,37 +885,47 @@ class PlaybackService : MediaSessionService() {
         val currentIndex = queueSnapshot.indexOfFirst { it.id == currentId }
         val remainingAhead = if (currentIndex >= 0) (queueSnapshot.lastIndex - currentIndex) else queueSnapshot.lastIndex
 
-        if (player.repeatMode == Player.REPEAT_MODE_OFF &&
+        if (serviceRepeatMode == PlayerRepeatMode.OFF &&
             (currentIndex >= queueSnapshot.lastIndex || queueSnapshot.size <= 1)
         ) {
             val seed = activeServiceSong ?: queueSnapshot.lastOrNull() ?: return
             val seq = servicePlaySeq.incrementAndGet()
             backgroundSkipJob?.cancel()
+            acquireTransitionWakeLock()
+
+            // NEVER call player.stop() or player.clearMediaItems() here — doing so dismisses the
+            // system media notification and causes Android to kill the background service!
             if (!autoTriggered && ::player.isInitialized) {
-                player.pause()
-                player.stop()
-                player.clearMediaItems()
+                if (player.isPlaying) {
+                    player.volume = 0f
+                } else {
+                    mediaSession?.let { runCatching { onUpdateNotification(it, true) } }
+                }
             }
             backgroundSkipJob = serviceScope.launch {
-                val added = fetchAndAppendServiceRadioBatch(seed, queueSnapshot)
-                if (seq != servicePlaySeq.get()) return@launch
-                if (added.isNotEmpty()) {
-                    resolveAndPlayInService(added.first())
-                } else {
-                    val otherTracks = queueSnapshot.filter { it.id != currentId }
-                    val fallbackTrack = if (otherTracks.isNotEmpty()) {
-                        if (isServiceShuffled) otherTracks.random() else otherTracks.first()
+                try {
+                    val added = fetchAndAppendServiceRadioBatch(seed, queueSnapshot)
+                    if (seq != servicePlaySeq.get()) return@launch
+                    if (added.isNotEmpty()) {
+                        resolveAndPlayInService(added.first())
                     } else {
-                        queueSnapshot.first()
+                        val otherTracks = queueSnapshot.filter { it.id != currentId }
+                        val fallbackTrack = if (otherTracks.isNotEmpty()) {
+                            if (isServiceShuffled) otherTracks.random() else otherTracks.first()
+                        } else {
+                            queueSnapshot.first()
+                        }
+                        resolveAndPlayInService(fallbackTrack)
                     }
-                    resolveAndPlayInService(fallbackTrack)
+                } finally {
+                    releaseTransitionWakeLock()
                 }
             }
             return
         }
 
         if (autoQueueEnabled &&
-            player.repeatMode == Player.REPEAT_MODE_OFF &&
+            serviceRepeatMode == PlayerRepeatMode.OFF &&
             remainingAhead < 5 &&
             backgroundAutoQueueJob?.isActive != true
         ) {
@@ -902,6 +978,7 @@ class PlaybackService : MediaSessionService() {
     private fun handleBackgroundSkipPrevious() {
         cancelActiveCrossfade()
         serviceConsecutiveFailures = 0
+        ensureQueueLoadedFromStorage()
         val queueSnapshot = serviceQueue
         if (queueSnapshot.isEmpty()) {
             player.seekTo(0L)
@@ -923,151 +1000,194 @@ class PlaybackService : MediaSessionService() {
         preparedCrossfadeSongId = null
         preparedCrossfadeUrl = null
         crossfadeTriggeredTrackId = null
-        if (::player.isInitialized) {
-            player.pause()
-            player.stop()
-            player.clearMediaItems()
-        }
-        backgroundSkipJob = serviceScope.launch {
-            activeServiceSong = targetSong
-            updateNotificationActionButtons(
-                isFavorite = targetSong.isFavorite,
-                isShuffled = isServiceShuffled
-            )
-            MiniPlayerWidgetProvider.syncWidget(applicationContext, targetSong, true)
-            _serviceEvents.emit(ServicePlaybackEvent.TrackResolving(targetSong))
 
-            val resolvedUrl = withContext(Dispatchers.IO) {
-                val localUri = repository.getOfflineLocalFileUri(targetSong.id)
-                when {
-                    !localUri.isNullOrBlank() -> localUri
-                    repository.isFullLengthStreamUrl(targetSong.streamUrl) -> targetSong.streamUrl
-                    else -> repository.getStreamUrl(
-                        videoId = targetSong.id,
-                        trackTitle = targetSong.title,
-                        artistName = targetSong.artist
-                    ).getOrDefault("")
-                }
-            }
+        // 1. INSTANT SYNCHRONOUS FAST-PATH:
+        // If this track's full-length stream (or offline file) is already cached or pre-resolved,
+        // swap atomically on the main thread right inside the button click / STATE_ENDED callback!
+        val fastStreamUrl = targetSong.streamUrl.takeIf { repository.isFullLengthStreamUrl(it) }
+            ?: repository.getCachedValidStreamUrl(targetSong.id)
 
-            if (seq != servicePlaySeq.get()) {
-                return@launch
-            }
-
-            if (resolvedUrl.isBlank()) {
-                serviceConsecutiveFailures++
-                if (serviceConsecutiveFailures < 3 && serviceQueue.size > 1) {
-                    handleBackgroundSkipNext(autoTriggered = true)
-                } else {
-                    MiniPlayerWidgetProvider.syncWidget(applicationContext, targetSong, false)
-                    _serviceEvents.emit(ServicePlaybackEvent.StreamUnavailable(targetSong))
-                }
-                return@launch
-            }
-
+        if (!fastStreamUrl.isNullOrBlank()) {
             serviceConsecutiveFailures = 0
-            val updatedSong = targetSong.copy(streamUrl = resolvedUrl)
+            val updatedSong = targetSong.copy(streamUrl = fastStreamUrl)
             activeServiceSong = updatedSong
             replaceSongInServiceQueue(updatedSong)
 
-            player.stop()
-            player.clearMediaItems()
-            player.volume = 1.0f
-            player.setMediaItem(buildMediaItemForSong(updatedSong))
-            if (startPositionMs > 0L) {
-                player.seekTo(startPositionMs)
-            }
-            player.playWhenReady = true
-            player.prepare()
-            player.play()
-
+            playMediaItemAtomically(updatedSong, startPositionMs)
             updateNotificationActionButtons(
                 isFavorite = updatedSong.isFavorite,
                 isShuffled = isServiceShuffled
             )
             MiniPlayerWidgetProvider.syncWidget(applicationContext, updatedSong, true)
             persistServiceSessionSnapshot()
-            _serviceEvents.emit(ServicePlaybackEvent.TrackTransitioned(updatedSong))
+            serviceScope.launch {
+                _serviceEvents.emit(ServicePlaybackEvent.TrackTransitioned(updatedSong))
+            }
             scheduleLookaheadPreResolve(updatedSong)
+            return
+        }
+
+        // 2. NOTIFICATION-SAFE ASYNC PATH (when the track needs live network resolution):
+        // NEVER call player.stop() or player.clearMediaItems() — keep the current MediaItem intact so
+        // MediaSessionService keeps the notification alive while we resolve in ~300-600ms!
+        acquireTransitionWakeLock()
+        if (::player.isInitialized) {
+            if (player.isPlaying) {
+                player.volume = 0f
+            } else {
+                // Anchor foreground service immediately while the notification button PendingIntent exemption is active
+                mediaSession?.let { runCatching { onUpdateNotification(it, true) } }
+            }
+        }
+
+        backgroundSkipJob = serviceScope.launch {
+            try {
+                activeServiceSong = targetSong
+                updateNotificationActionButtons(
+                    isFavorite = targetSong.isFavorite,
+                    isShuffled = isServiceShuffled
+                )
+                MiniPlayerWidgetProvider.syncWidget(applicationContext, targetSong, true)
+                _serviceEvents.emit(ServicePlaybackEvent.TrackResolving(targetSong))
+
+                val resolvedUrl = withContext(Dispatchers.IO) {
+                    val localUri = repository.getOfflineLocalFileUri(targetSong.id)
+                    when {
+                        !localUri.isNullOrBlank() -> localUri
+                        repository.isFullLengthStreamUrl(targetSong.streamUrl) -> targetSong.streamUrl
+                        else -> repository.getStreamUrl(
+                            videoId = targetSong.id,
+                            trackTitle = targetSong.title,
+                            artistName = targetSong.artist
+                        ).getOrDefault("")
+                    }
+                }
+
+                if (seq != servicePlaySeq.get()) {
+                    return@launch
+                }
+
+                if (resolvedUrl.isBlank()) {
+                    serviceConsecutiveFailures++
+                    if (serviceConsecutiveFailures < 5 && (serviceQueue.size > 1 || autoQueueEnabled)) {
+                        handleBackgroundSkipNext(autoTriggered = true)
+                    } else {
+                        if (::player.isInitialized) {
+                            player.volume = 1.0f
+                            player.pause()
+                        }
+                        MiniPlayerWidgetProvider.syncWidget(applicationContext, targetSong, false)
+                        _serviceEvents.emit(ServicePlaybackEvent.StreamUnavailable(targetSong))
+                    }
+                    return@launch
+                }
+
+                serviceConsecutiveFailures = 0
+                val updatedSong = targetSong.copy(streamUrl = resolvedUrl)
+                activeServiceSong = updatedSong
+                replaceSongInServiceQueue(updatedSong)
+
+                playMediaItemAtomically(updatedSong, startPositionMs)
+
+                updateNotificationActionButtons(
+                    isFavorite = updatedSong.isFavorite,
+                    isShuffled = isServiceShuffled
+                )
+                MiniPlayerWidgetProvider.syncWidget(applicationContext, updatedSong, true)
+                persistServiceSessionSnapshot()
+                _serviceEvents.emit(ServicePlaybackEvent.TrackTransitioned(updatedSong))
+                scheduleLookaheadPreResolve(updatedSong)
+            } finally {
+                releaseTransitionWakeLock()
+            }
         }
     }
 
     /**
-     * Pre-resolves the upcoming song's full-length 320kbps stream URL in the background
-     * while the current song is playing. When Gapless Playback is enabled and Crossfade is off,
-     * queues the next MediaItem directly onto ExoPlayer for zero-gap transitions.
+     * Proactively pre-resolves the next 2 upcoming songs' full-length stream URLs in the background
+     * so automatic track progression and notification/headset Next skips start instantaneously (0ms wait).
+     * When Gapless Playback is enabled and Crossfade is off, attaches the next MediaItem natively onto ExoPlayer.
      */
     private fun scheduleLookaheadPreResolve(currentSong: SongItem) {
         lookaheadPreResolveJob?.cancel()
         lookaheadPreResolveJob = serviceScope.launch(Dispatchers.IO) {
-            delay(1_200L)
+            delay(350L)
             var queueSnapshot = serviceQueue
             if (queueSnapshot.isEmpty()) return@launch
             val currentIdx = queueSnapshot.indexOfFirst { it.id == currentSong.id }
             if (currentIdx < 0) return@launch
 
-            val currentRepeatMode = withContext(Dispatchers.Main) {
-                if (::player.isInitialized) player.repeatMode else Player.REPEAT_MODE_OFF
-            }
-
-            // On Repeat OFF at the tail of the queue, proactively refill Auto-Queue Radio
-            // instead of wrapping around to index 0.
-            if (currentIdx >= queueSnapshot.lastIndex && currentRepeatMode == Player.REPEAT_MODE_OFF) {
+            // On Repeat OFF near the tail of the queue, proactively refill Auto-Queue Radio
+            if (currentIdx >= queueSnapshot.lastIndex - 1 && serviceRepeatMode == PlayerRepeatMode.OFF) {
                 if (autoQueueEnabled) {
-                    val added = fetchAndAppendServiceRadioBatch(currentSong, queueSnapshot)
+                    val added = fetchAndAppendServiceRadioBatch(queueSnapshot.last(), queueSnapshot)
                     if (added.isNotEmpty()) {
                         queueSnapshot = serviceQueue
-                    } else {
+                    } else if (currentIdx >= queueSnapshot.lastIndex) {
                         return@launch
                     }
-                } else {
+                } else if (currentIdx >= queueSnapshot.lastIndex) {
                     return@launch
                 }
             }
 
             val updatedCurrentIdx = queueSnapshot.indexOfFirst { it.id == currentSong.id }
             if (updatedCurrentIdx < 0 || queueSnapshot.size <= 1) return@launch
-            val nextIdx = (updatedCurrentIdx + 1) % queueSnapshot.size
-            val nextSong = queueSnapshot[nextIdx]
-            if (nextSong.id == currentSong.id) return@launch
 
-            val localUri = repository.getOfflineLocalFileUri(nextSong.id)
-            val resolvedUrl = when {
-                !localUri.isNullOrBlank() -> localUri
-                repository.isFullLengthStreamUrl(nextSong.streamUrl) -> nextSong.streamUrl
-                else -> repository.getStreamUrl(
-                    videoId = nextSong.id,
-                    trackTitle = nextSong.title,
-                    artistName = nextSong.artist
-                ).getOrDefault("")
-            }
-            if (resolvedUrl.isBlank()) return@launch
+            val lookaheadOffsets = if (queueSnapshot.size >= 3) listOf(1, 2) else listOf(1)
+            for (offset in lookaheadOffsets) {
+                if (!isActive) return@launch
+                val targetIdx = if (serviceRepeatMode == PlayerRepeatMode.OFF) {
+                    val candidateIdx = updatedCurrentIdx + offset
+                    if (candidateIdx > queueSnapshot.lastIndex) continue
+                    candidateIdx
+                } else {
+                    (updatedCurrentIdx + offset) % queueSnapshot.size
+                }
+                val upcomingSong = queueSnapshot[targetIdx]
+                if (upcomingSong.id == currentSong.id) continue
 
-            val updatedNext = nextSong.copy(streamUrl = resolvedUrl)
-            replaceSongInServiceQueue(updatedNext)
+                val localUri = repository.getOfflineLocalFileUri(upcomingSong.id)
+                val resolvedUrl = when {
+                    !localUri.isNullOrBlank() -> localUri
+                    repository.isFullLengthStreamUrl(upcomingSong.streamUrl) -> upcomingSong.streamUrl
+                    else -> repository.getCachedValidStreamUrl(upcomingSong.id)
+                        ?: repository.getStreamUrl(
+                            videoId = upcomingSong.id,
+                            trackTitle = upcomingSong.title,
+                            artistName = upcomingSong.artist
+                        ).getOrDefault("")
+                }
+                if (resolvedUrl.isBlank()) continue
 
-            // Queue into ExoPlayer natively for true gapless playback when Crossfade == 0
-            withContext(Dispatchers.Main) {
-                if (!::player.isInitialized) return@withContext
-                val activeId = activeServiceSong?.id ?: player.currentMediaItem?.mediaId
-                if (activeId == currentSong.id &&
-                    crossfadeSeconds == 0 &&
-                    gaplessPlaybackEnabled &&
-                    player.repeatMode != Player.REPEAT_MODE_ONE &&
-                    !stopAfterCurrentTrackFlag
-                ) {
-                    val curMediaIdx = player.currentMediaItemIndex
-                    val nextMediaIdx = curMediaIdx + 1
-                    val existingNextId = if (nextMediaIdx < player.mediaItemCount) {
-                        player.getMediaItemAt(nextMediaIdx).mediaId
-                    } else {
-                        null
-                    }
-                    if (existingNextId != updatedNext.id) {
-                        if (nextMediaIdx < player.mediaItemCount) {
-                            player.removeMediaItems(nextMediaIdx, player.mediaItemCount)
+                val updatedUpcoming = upcomingSong.copy(streamUrl = resolvedUrl)
+                replaceSongInServiceQueue(updatedUpcoming)
+
+                // Queue the immediate next track natively into ExoPlayer for true 0ms gapless transition when Crossfade == 0
+                if (offset == 1) {
+                    withContext(Dispatchers.Main) {
+                        if (!::player.isInitialized) return@withContext
+                        val activeId = activeServiceSong?.id ?: player.currentMediaItem?.mediaId
+                        if (activeId == currentSong.id &&
+                            crossfadeSeconds == 0 &&
+                            gaplessPlaybackEnabled &&
+                            serviceRepeatMode != PlayerRepeatMode.ONE &&
+                            !stopAfterCurrentTrackFlag
+                        ) {
+                            val curMediaIdx = player.currentMediaItemIndex
+                            val nextMediaIdx = curMediaIdx + 1
+                            val existingNextId = if (nextMediaIdx < player.mediaItemCount) {
+                                player.getMediaItemAt(nextMediaIdx).mediaId
+                            } else {
+                                null
+                            }
+                            if (existingNextId != updatedUpcoming.id) {
+                                if (nextMediaIdx < player.mediaItemCount) {
+                                    player.removeMediaItems(nextMediaIdx, player.mediaItemCount)
+                                }
+                                player.addMediaItem(buildMediaItemForSong(updatedUpcoming))
+                            }
                         }
-                        player.addMediaItem(buildMediaItemForSong(updatedNext))
                     }
                 }
             }
@@ -1078,7 +1198,7 @@ class PlaybackService : MediaSessionService() {
         if (!::player.isInitialized || player.mediaItemCount == 0) return
         val curIdx = player.currentMediaItemIndex
         val nextStart = curIdx + 1
-        if (crossfadeSeconds > 0 || !gaplessPlaybackEnabled || player.repeatMode == Player.REPEAT_MODE_ONE) {
+        if (crossfadeSeconds > 0 || !gaplessPlaybackEnabled || serviceRepeatMode == PlayerRepeatMode.ONE) {
             if (nextStart < player.mediaItemCount) {
                 player.removeMediaItems(nextStart, player.mediaItemCount)
             }
@@ -1090,21 +1210,12 @@ class PlaybackService : MediaSessionService() {
     private fun persistServiceSessionSnapshot() {
         val active = activeServiceSong ?: return
         val pos = if (::player.isInitialized) player.currentPosition.coerceAtLeast(0L) else 0L
-        val rep = if (::player.isInitialized) {
-            when (player.repeatMode) {
-                Player.REPEAT_MODE_ALL -> PlayerRepeatMode.ALL
-                Player.REPEAT_MODE_ONE -> PlayerRepeatMode.ONE
-                else -> PlayerRepeatMode.OFF
-            }
-        } else {
-            PlayerRepeatMode.OFF
-        }
         PlaybackSessionStore.saveSession(
             context = applicationContext,
             currentTrack = active,
             queue = serviceQueue,
             progressMs = pos,
-            repeatMode = rep,
+            repeatMode = serviceRepeatMode,
             isShuffled = isServiceShuffled,
             autoQueuedIds = emptySet()
         )
@@ -1270,8 +1381,6 @@ class PlaybackService : MediaSessionService() {
                 .add(SessionCommand(CMD_SET_EQ_BAND, Bundle.EMPTY))
                 .add(SessionCommand(CMD_SET_BASS_BOOST, Bundle.EMPTY))
                 .add(SessionCommand(CMD_SET_EQ_ENABLED, Bundle.EMPTY))
-                .add(SessionCommand(CMD_SET_CROSSFADE_SECONDS, Bundle.EMPTY))
-                .add(SessionCommand(CMD_SET_GAPLESS_PLAYBACK, Bundle.EMPTY))
                 .add(SessionCommand(CMD_TOGGLE_FAVORITE, Bundle.EMPTY))
                 .add(SessionCommand(CMD_REFRESH_FAVORITE_ICON, Bundle.EMPTY))
                 .add(SessionCommand(CMD_TOGGLE_SHUFFLE, Bundle.EMPTY))
@@ -1279,6 +1388,7 @@ class PlaybackService : MediaSessionService() {
                 .add(SessionCommand(CMD_SET_STOP_AFTER_CURRENT, Bundle.EMPTY))
                 .add(SessionCommand(CMD_SET_AUTO_QUEUE_RADIO, Bundle.EMPTY))
                 .add(SessionCommand(CMD_CANCEL_PENDING_LOAD, Bundle.EMPTY))
+                .add(SessionCommand(CMD_SET_REPEAT_MODE, Bundle.EMPTY))
                 .build()
 
             val playerCommands = MediaSession.ConnectionResult.DEFAULT_PLAYER_COMMANDS.buildUpon()
@@ -1311,11 +1421,18 @@ class PlaybackService : MediaSessionService() {
                     preparedCrossfadeSongId = null
                     preparedCrossfadeUrl = null
                     crossfadeTriggeredTrackId = null
-                    if (args.getBoolean(ARG_STOP_PLAYER, true) && ::player.isInitialized) {
+                    // Never clearMediaItems() or stop() here so the system notification stays intact while resolving
+                    if (args.getBoolean(ARG_STOP_PLAYER, false) && ::player.isInitialized && player.isPlaying) {
                         player.pause()
-                        player.stop()
-                        player.clearMediaItems()
                     }
+                }
+                CMD_SET_REPEAT_MODE -> {
+                    val modeName = args.getString(ARG_REPEAT_MODE).orEmpty()
+                    serviceRepeatMode = runCatching {
+                        PlayerRepeatMode.valueOf(modeName)
+                    }.getOrDefault(PlayerRepeatMode.OFF)
+                    applyExoPlayerRepeatMode()
+                    refreshGaplessMediaQueue()
                 }
                 CMD_TOGGLE_FAVORITE -> toggleCurrentTrackFavoriteFromNotification()
                 CMD_REFRESH_FAVORITE_ICON -> {
@@ -1343,17 +1460,6 @@ class PlaybackService : MediaSessionService() {
                 }
                 CMD_SET_AUTO_QUEUE_RADIO -> {
                     autoQueueEnabled = true
-                }
-                CMD_SET_CROSSFADE_SECONDS -> {
-                    crossfadeSeconds = args.getInt(ARG_CROSSFADE_SECONDS, 4).coerceIn(0, 12)
-                    if (crossfadeSeconds == 0) {
-                        cancelActiveCrossfade()
-                    }
-                    refreshGaplessMediaQueue()
-                }
-                CMD_SET_GAPLESS_PLAYBACK -> {
-                    gaplessPlaybackEnabled = args.getBoolean(ARG_GAPLESS_ENABLED, true)
-                    refreshGaplessMediaQueue()
                 }
                 CMD_SET_EQ_BAND -> {
                     val bandIndex = args.getShort(ARG_BAND_INDEX, 0)
@@ -1402,8 +1508,16 @@ class PlaybackService : MediaSessionService() {
         return mediaSession
     }
 
+    override fun onUpdateNotification(session: MediaSession, startInForegroundRequired: Boolean) {
+        val keepForeground = startInForegroundRequired || isTrackTransitionInFlight()
+        runCatching {
+            super.onUpdateNotification(session, keepForeground)
+        }
+    }
+
     override fun onTaskRemoved(rootIntent: Intent?) {
         persistServiceSessionSnapshot()
+        if (isTrackTransitionInFlight()) return
         val sessionPlayer = mediaSession?.player
         if (sessionPlayer == null || !sessionPlayer.playWhenReady || sessionPlayer.mediaItemCount == 0) {
             stopSelf()
@@ -1412,10 +1526,7 @@ class PlaybackService : MediaSessionService() {
 
     override fun onDestroy() {
         persistServiceSessionSnapshot()
-        audioDeviceCallback?.let { cb ->
-            runCatching { audioManager?.unregisterAudioDeviceCallback(cb) }
-        }
-        audioDeviceCallback = null
+        releaseTransitionWakeLock()
         fadeOutJob?.cancel()
         backgroundSkipJob?.cancel()
         lookaheadPreResolveJob?.cancel()
@@ -1442,7 +1553,6 @@ class PlaybackService : MediaSessionService() {
         data class FavoriteToggled(val songId: String, val isFavorite: Boolean) : ServicePlaybackEvent
         data class ShuffleToggled(val isShuffled: Boolean) : ServicePlaybackEvent
         data class AutoQueueReplenished(val songs: List<SongItem>) : ServicePlaybackEvent
-        data class AudioRouteChanged(val route: AudioOutputRoute) : ServicePlaybackEvent
         data object SleepTimerEndedTrack : ServicePlaybackEvent
     }
 
@@ -1452,8 +1562,6 @@ class PlaybackService : MediaSessionService() {
         const val CMD_SET_EQ_BAND = "com.example.somify.CMD_SET_EQ_BAND"
         const val CMD_SET_BASS_BOOST = "com.example.somify.CMD_SET_BASS_BOOST"
         const val CMD_SET_EQ_ENABLED = "com.example.somify.CMD_SET_EQ_ENABLED"
-        const val CMD_SET_CROSSFADE_SECONDS = "com.example.spiral.CMD_SET_CROSSFADE_SECONDS"
-        const val CMD_SET_GAPLESS_PLAYBACK = "com.example.spiral.CMD_SET_GAPLESS_PLAYBACK"
         const val CMD_TOGGLE_FAVORITE = "com.example.spiral.CMD_TOGGLE_FAVORITE"
         const val CMD_REFRESH_FAVORITE_ICON = "com.example.spiral.CMD_REFRESH_FAVORITE_ICON"
         const val CMD_TOGGLE_SHUFFLE = "com.example.spiral.CMD_TOGGLE_SHUFFLE"
@@ -1461,18 +1569,18 @@ class PlaybackService : MediaSessionService() {
         const val CMD_SET_STOP_AFTER_CURRENT = "com.example.spiral.CMD_SET_STOP_AFTER_CURRENT"
         const val CMD_SET_AUTO_QUEUE_RADIO = "com.example.spiral.CMD_SET_AUTO_QUEUE_RADIO"
         const val CMD_CANCEL_PENDING_LOAD = "com.example.spiral.CMD_CANCEL_PENDING_LOAD"
+        const val CMD_SET_REPEAT_MODE = "com.example.spiral.CMD_SET_REPEAT_MODE"
 
         const val ARG_BAND_INDEX = "arg_band_index"
         const val ARG_BAND_LEVEL = "arg_band_level"
         const val ARG_BASS_STRENGTH = "arg_bass_strength"
         const val ARG_EQ_ENABLED = "arg_eq_enabled"
-        const val ARG_CROSSFADE_SECONDS = "arg_crossfade_seconds"
-        const val ARG_GAPLESS_ENABLED = "arg_gapless_enabled"
         const val ARG_IS_FAVORITE = "arg_is_favorite"
         const val ARG_IS_SHUFFLED = "arg_is_shuffled"
         const val ARG_STOP_AFTER_CURRENT = "arg_stop_after_current"
         const val ARG_AUTO_QUEUE_ENABLED = "arg_auto_queue_enabled"
         const val ARG_STOP_PLAYER = "arg_stop_player"
+        const val ARG_REPEAT_MODE = "arg_repeat_mode"
 
         private const val EXTRA_SONG_ID = "extra_song_id"
         private const val EXTRA_SONG_TITLE = "extra_song_title"
@@ -1498,10 +1606,6 @@ class PlaybackService : MediaSessionService() {
             private set
 
         @Volatile
-        var currentOutputRoute: AudioOutputRoute = AudioOutputRoute.SPEAKER
-            private set
-
-        @Volatile
         var stopAfterCurrentTrackFlag: Boolean = false
 
         @Volatile
@@ -1518,33 +1622,6 @@ class PlaybackService : MediaSessionService() {
 
         private val _serviceEvents = MutableSharedFlow<ServicePlaybackEvent>(extraBufferCapacity = 16)
         val serviceEvents: SharedFlow<ServicePlaybackEvent> = _serviceEvents.asSharedFlow()
-
-        fun detectCurrentAudioOutputRoute(context: Context): AudioOutputRoute {
-            val manager = context.applicationContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-                ?: return AudioOutputRoute.SPEAKER
-            val outputs = manager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-            val hasBluetooth = outputs.any { dev ->
-                dev.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
-                    dev.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
-                    (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
-                        (dev.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
-                            dev.type == AudioDeviceInfo.TYPE_BLE_SPEAKER ||
-                            dev.type == AudioDeviceInfo.TYPE_BLE_BROADCAST)) ||
-                    dev.type == AudioDeviceInfo.TYPE_HEARING_AID
-            }
-            if (hasBluetooth) return AudioOutputRoute.BLUETOOTH
-
-            val hasWired = outputs.any { dev ->
-                dev.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
-                    dev.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
-                    dev.type == AudioDeviceInfo.TYPE_USB_HEADSET ||
-                    dev.type == AudioDeviceInfo.TYPE_USB_DEVICE ||
-                    dev.type == AudioDeviceInfo.TYPE_USB_ACCESSORY
-            }
-            if (hasWired) return AudioOutputRoute.WIRED_HEADPHONES
-
-            return AudioOutputRoute.SPEAKER
-        }
 
         @Synchronized
         fun syncQueueFromUi(queue: List<SongItem>, activeSong: SongItem? = null) {

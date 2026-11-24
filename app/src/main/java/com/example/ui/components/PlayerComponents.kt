@@ -2,6 +2,7 @@ package com.example.ui.components
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
@@ -19,7 +20,9 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
+import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.Canvas
@@ -134,6 +137,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -181,6 +185,7 @@ import coil.request.ImageRequest
 import coil.request.SuccessResult
 import coil.size.Precision
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import com.example.data.model.EqualizerState
@@ -198,7 +203,9 @@ import com.example.ui.theme.DimSlate
 import com.example.ui.theme.ElectricMint
 import com.example.ui.theme.GlassSurface
 import com.example.ui.theme.JetBrainsMonoFontFamily
+import com.example.ui.theme.LocalMotionConfig
 import com.example.ui.theme.LocalStudioPalette
+import com.example.ui.theme.MotionTokens
 import com.example.ui.theme.MutedSlate
 import com.example.ui.theme.NeonViolet
 import com.example.ui.theme.PhotoForegroundColor
@@ -208,6 +215,7 @@ import com.example.ui.theme.PitchBlack
 import com.example.ui.theme.SubtleBorder
 import com.example.ui.theme.SunsetCoral
 import com.example.ui.theme.ThemeOnPrimary
+import com.example.ui.theme.rubberBandDrag
 import java.io.File
 import java.io.FileOutputStream
 import java.util.Locale
@@ -257,25 +265,29 @@ fun SoftTonalCircleIconButton(
         else -> resolvedInactiveTint
     }
 
+    val reduceMotion = LocalMotionConfig.current.reduceMotion
     val resolvedContainer by animateColorAsState(
         targetValue = targetContainer,
-        animationSpec = tween(180),
+        animationSpec = MotionTokens.microTween(reduceMotion),
         label = "softCircleContainer"
     )
     val resolvedBorderColor by animateColorAsState(
         targetValue = targetBorderColor,
-        animationSpec = tween(180),
+        animationSpec = MotionTokens.microTween(reduceMotion),
         label = "softCircleBorder"
     )
     val interactionSource = remember { MutableInteractionSource() }
     val isPressed by interactionSource.collectIsPressedAsState()
-    val buttonScale by animateFloatAsState(
-        targetValue = if (isPressed && enabled) 0.88f else 1f,
-        animationSpec = spring(
-            dampingRatio = Spring.DampingRatioMediumBouncy,
-            stiffness = Spring.StiffnessMedium
-        ),
-        label = "softCirclePressScale"
+    // Principle #4: Subtle Squash & Stretch on press-down (GPU draw-phase only)
+    val buttonScaleX by animateFloatAsState(
+        targetValue = if (isPressed && enabled && !reduceMotion) 1.04f else 1f,
+        animationSpec = MotionTokens.snappySpring(reduceMotion),
+        label = "softCirclePressScaleX"
+    )
+    val buttonScaleY by animateFloatAsState(
+        targetValue = if (isPressed && enabled && !reduceMotion) 0.88f else 1f,
+        animationSpec = MotionTokens.snappySpring(reduceMotion),
+        label = "softCirclePressScaleY"
     )
 
     Box(
@@ -283,8 +295,8 @@ fun SoftTonalCircleIconButton(
             .minimumInteractiveComponentSize()
             .size(size)
             .graphicsLayer {
-                scaleX = buttonScale
-                scaleY = buttonScale
+                scaleX = buttonScaleX
+                scaleY = buttonScaleY
             }
             .clip(CircleShape)
             .background(resolvedContainer)
@@ -300,8 +312,12 @@ fun SoftTonalCircleIconButton(
         AnimatedContent(
             targetState = icon,
             transitionSpec = {
-                (scaleIn(spring(dampingRatio = Spring.DampingRatioMediumBouncy)) + fadeIn(tween(130)))
-                    .togetherWith(scaleOut(tween(100)) + fadeOut(tween(100)))
+                if (reduceMotion) {
+                    fadeIn(tween(90)).togetherWith(fadeOut(tween(80)))
+                } else {
+                    (scaleIn(MotionTokens.tactilePopSpring(false)) + fadeIn(tween(MotionTokens.MicroMs)))
+                        .togetherWith(scaleOut(tween(90)) + fadeOut(tween(90)))
+                }
             },
             label = "softCircleIconMorph"
         ) { targetIcon ->
@@ -388,84 +404,78 @@ fun AnimatedFavoriteButton(
     inactiveTint: Color = Color.Unspecified,
     containerColor: Color = Color.Unspecified
 ) {
+    val reduceMotion = LocalMotionConfig.current.reduceMotion
     val resolvedActiveTintArg = activeTint.takeOrElse { SunsetCoral }
     val resolvedInactiveTintArg = inactiveTint.takeOrElse { MutedSlate }
     val resolvedContainerArg = containerColor.takeOrElse { CarbonElevated }
     val burstAccentColor = ElectricMint
     val haptic = LocalHapticFeedback.current
-    val heartScale = remember { Animatable(1f) }
+    val heartScaleX = remember { Animatable(1f) }
+    val heartScaleY = remember { Animatable(1f) }
     val heartRotation = remember { Animatable(0f) }
     val burstProgress = remember { Animatable(0f) }
 
     var previousFavorite by remember { mutableStateOf(isFavorite) }
 
-    LaunchedEffect(isFavorite) {
+    LaunchedEffect(isFavorite, reduceMotion) {
         if (isFavorite != previousFavorite) {
             previousFavorite = isFavorite
-            if (isFavorite) {
+            if (reduceMotion) {
+                burstProgress.snapTo(0f)
+                heartRotation.snapTo(0f)
+                heartScaleX.snapTo(1f)
+                heartScaleY.snapTo(1f)
+            } else if (isFavorite) {
+                // Principle #16: Secondary Action (8-dot radial shimmer + shockwave ring)
                 launch {
                     burstProgress.snapTo(0.01f)
                     burstProgress.animateTo(
                         targetValue = 1f,
-                        animationSpec = tween(durationMillis = 480, easing = FastOutSlowInEasing)
+                        animationSpec = tween(durationMillis = 420, easing = MotionTokens.EmphasizedDecelerate)
                     )
                     burstProgress.snapTo(0f)
                 }
                 launch {
                     heartRotation.snapTo(0f)
-                    heartRotation.animateTo(-14f, tween(70))
-                    heartRotation.animateTo(11f, tween(95))
-                    heartRotation.animateTo(
-                        targetValue = 0f,
-                        animationSpec = spring(
-                            dampingRatio = Spring.DampingRatioMediumBouncy,
-                            stiffness = Spring.StiffnessMedium
-                        )
-                    )
+                    heartRotation.animateTo(-12f, tween(60))
+                    heartRotation.animateTo(9f, tween(85))
+                    heartRotation.animateTo(0f, MotionTokens.snappySpring(false))
                 }
-                heartScale.snapTo(0.70f)
-                heartScale.animateTo(
-                    targetValue = 1.34f,
-                    animationSpec = spring(
-                        dampingRatio = Spring.DampingRatioLowBouncy,
-                        stiffness = Spring.StiffnessMedium
-                    )
-                )
-                heartScale.animateTo(
-                    targetValue = 1.0f,
-                    animationSpec = spring(
-                        dampingRatio = Spring.DampingRatioMediumBouncy,
-                        stiffness = Spring.StiffnessMediumLow
-                    )
-                )
+                // Principle #7 (Anticipation) + #4 (Squash & Stretch) + #1 (Exaggeration)
+                launch {
+                    heartScaleX.animateTo(1.14f, tween(50))
+                    heartScaleX.animateTo(1.24f, MotionTokens.tactilePopSpring(false))
+                    heartScaleX.animateTo(1.0f, MotionTokens.snappySpring(false))
+                }
+                heartScaleY.animateTo(0.76f, tween(50))
+                heartScaleY.animateTo(1.26f, MotionTokens.tactilePopSpring(false))
+                heartScaleY.animateTo(1.0f, MotionTokens.snappySpring(false))
             } else {
                 burstProgress.snapTo(0f)
                 heartRotation.snapTo(0f)
-                heartScale.snapTo(0.76f)
-                heartScale.animateTo(
-                    targetValue = 1.0f,
-                    animationSpec = spring(
-                        dampingRatio = Spring.DampingRatioMediumBouncy,
-                        stiffness = Spring.StiffnessMedium
-                    )
-                )
+                launch {
+                    heartScaleX.snapTo(0.84f)
+                    heartScaleX.animateTo(1.0f, MotionTokens.snappySpring(false))
+                }
+                heartScaleY.snapTo(0.84f)
+                heartScaleY.animateTo(1.0f, MotionTokens.snappySpring(false))
             }
         }
     }
 
     val resolvedContainer by animateColorAsState(
         targetValue = if (isFavorite) resolvedActiveTintArg.copy(alpha = 0.18f) else resolvedContainerArg,
-        animationSpec = tween(durationMillis = 180),
+        animationSpec = MotionTokens.microTween(reduceMotion),
         label = "favContainerColor"
     )
     val resolvedBorder by animateColorAsState(
         targetValue = if (isFavorite) resolvedActiveTintArg.copy(alpha = 0.65f) else SubtleBorder.copy(alpha = 0.65f),
-        animationSpec = tween(durationMillis = 180),
+        animationSpec = MotionTokens.microTween(reduceMotion),
         label = "favBorderColor"
     )
     val resolvedTint by animateColorAsState(
         targetValue = if (isFavorite) resolvedActiveTintArg else resolvedInactiveTintArg,
-        animationSpec = tween(durationMillis = 180),
+        animationSpec = MotionTokens.microTween(reduceMotion),
         label = "favIconTint"
     )
 
@@ -478,23 +488,23 @@ fun AnimatedFavoriteButton(
                 if (p > 0.01f && p < 0.99f) {
                     val fade = (1f - p).coerceIn(0f, 1f)
                     val baseRadius = this.size.minDimension * 0.48f
-                    val ringRadius = baseRadius * (0.75f + p * 0.72f)
+                    val ringRadius = baseRadius * (0.74f + p * 0.78f)
                     drawCircle(
-                        color = resolvedActiveTintArg.copy(alpha = 0.55f * fade),
+                        color = resolvedActiveTintArg.copy(alpha = 0.52f * fade),
                         radius = ringRadius,
-                        style = Stroke(width = 2.dp.toPx() * fade)
+                        style = Stroke(width = 1.9.dp.toPx() * fade)
                     )
 
-                    val particleCount = 6
-                    val orbitRadius = baseRadius * (0.65f + p * 0.88f)
-                    val dotRadius = 2.2.dp.toPx() * fade
+                    val particleCount = 8
+                    val orbitRadius = baseRadius * (0.64f + p * 0.92f)
+                    val dotRadius = 2.0.dp.toPx() * fade
                     for (i in 0 until particleCount) {
-                        val angle = (i * 60f - 15f) * (Math.PI.toFloat() / 180f)
+                        val angle = (i * 45f - 18f) * (Math.PI.toFloat() / 180f)
                         val px = center.x + cos(angle) * orbitRadius
                         val py = center.y + sin(angle) * orbitRadius
                         val dotColor = if (i % 2 == 0) resolvedActiveTintArg else burstAccentColor
                         drawCircle(
-                            color = dotColor.copy(alpha = 0.85f * fade),
+                            color = dotColor.copy(alpha = 0.88f * fade),
                             radius = dotRadius,
                             center = Offset(px, py)
                         )
@@ -517,8 +527,8 @@ fun AnimatedFavoriteButton(
             modifier = Modifier
                 .size(iconSize)
                 .graphicsLayer {
-                    scaleX = heartScale.value
-                    scaleY = heartScale.value
+                    scaleX = heartScaleX.value
+                    scaleY = heartScaleY.value
                     rotationZ = heartRotation.value
                 }
         )
@@ -693,56 +703,105 @@ fun MiniPlayer(
     onDismiss: () -> Unit,
     onSkipPrevious: () -> Unit = {},
     onToggleFavorite: () -> Unit = {},
+    isResolving: Boolean = false,
     modifier: Modifier = Modifier
 ) {
-    var dragOffsetX by remember { mutableFloatStateOf(0f) }
-    var dragOffsetY by remember { mutableFloatStateOf(0f) }
+    val reduceMotion = LocalMotionConfig.current.reduceMotion
+    val coroutineScope = rememberCoroutineScope()
+    val haptic = LocalHapticFeedback.current
+    val density = LocalDensity.current
 
-    val animatedOffsetX by animateFloatAsState(
-        targetValue = dragOffsetX,
-        animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessMedium),
-        label = "miniOffsetX"
-    )
-    val animatedOffsetY by animateFloatAsState(
-        targetValue = dragOffsetY,
-        animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessMedium),
-        label = "miniOffsetY"
-    )
+    // Principle #15 (Interruptible Motion) + #5 (Rubber Banding) + #12 (Arcs) + #17 (Solid Drawing)
+    val offsetX = remember { Animatable(0f) }
+    val offsetY = remember { Animatable(0f) }
+    var rawDragX by remember { mutableFloatStateOf(0f) }
+    var rawDragY by remember { mutableFloatStateOf(0f) }
+    var didTriggerThresholdHaptic by remember { mutableStateOf(false) }
 
-    val (ambientPrimary, ambientSecondary) = rememberDynamicArtworkGlow(currentTrack.artworkUrl)
+    val skipThresholdPx = with(density) { 78.dp.toPx() }
+    val dismissThresholdPx = with(density) { 82.dp.toPx() }
+
+    val (ambientPrimary, _) = rememberDynamicArtworkGlow(currentTrack.artworkUrl)
 
     Box(
         modifier = modifier
             .fillMaxWidth()
             .padding(horizontal = 12.dp, vertical = 6.dp)
-            .offset { IntOffset(animatedOffsetX.roundToInt(), animatedOffsetY.roundToInt()) }
+            .graphicsLayer {
+                val dx = offsetX.value
+                val dy = offsetY.value
+                translationX = dx
+                translationY = dy
+                if (!reduceMotion) {
+                    val normX = (dx / skipThresholdPx).coerceIn(-1.4f, 1.4f)
+                    rotationZ = normX * 2.1f
+                    val dragProgress = (abs(dx) / (skipThresholdPx * 3.5f)).coerceIn(0f, 0.05f)
+                    scaleX = 1f - dragProgress * 0.45f
+                    scaleY = 1f - dragProgress * 0.45f
+                }
+                alpha = (1f - (dy / (dismissThresholdPx * 2.4f)).coerceAtLeast(0f)).coerceIn(0.45f, 1f)
+            }
             .shadow(16.dp, RoundedCornerShape(20.dp))
             .clip(RoundedCornerShape(20.dp))
             .background(CarbonSurface)
             .border(
                 width = 0.85.dp,
-                color = SubtleBorder,
+                color = if (isResolving) ElectricMint.copy(alpha = 0.6f) else SubtleBorder,
                 shape = RoundedCornerShape(20.dp)
             )
             .pointerInput(currentTrack.id) {
                 detectDragGestures(
-                    onDragEnd = {
-                        when {
-                            dragOffsetX < -105f -> onSkipNext()
-                            dragOffsetX > 105f -> onSkipPrevious()
-                            dragOffsetY > 110f -> onDismiss()
+                    onDragStart = {
+                        didTriggerThresholdHaptic = false
+                        // Principle #15: Immediately interrupt any in-flight spring rebound
+                        coroutineScope.launch {
+                            offsetX.stop()
+                            offsetY.stop()
                         }
-                        dragOffsetX = 0f
-                        dragOffsetY = 0f
+                        rawDragX = offsetX.value
+                        rawDragY = offsetY.value
+                    },
+                    onDragEnd = {
+                        val finalX = offsetX.value
+                        val finalY = offsetY.value
+                        when {
+                            finalX <= -skipThresholdPx -> onSkipNext()
+                            finalX >= skipThresholdPx -> onSkipPrevious()
+                            finalY >= dismissThresholdPx -> onDismiss()
+                        }
+                        rawDragX = 0f
+                        rawDragY = 0f
+                        coroutineScope.launch {
+                            launch { offsetX.animateTo(0f, MotionTokens.fluidSpring(reduceMotion)) }
+                            launch { offsetY.animateTo(0f, MotionTokens.fluidSpring(reduceMotion)) }
+                        }
                     },
                     onDragCancel = {
-                        dragOffsetX = 0f
-                        dragOffsetY = 0f
+                        rawDragX = 0f
+                        rawDragY = 0f
+                        coroutineScope.launch {
+                            launch { offsetX.animateTo(0f, MotionTokens.fluidSpring(reduceMotion)) }
+                            launch { offsetY.animateTo(0f, MotionTokens.fluidSpring(reduceMotion)) }
+                        }
                     },
                     onDrag = { change, dragAmount ->
                         change.consume()
-                        dragOffsetX = (dragOffsetX + dragAmount.x).coerceIn(-220f, 220f)
-                        dragOffsetY = (dragOffsetY + dragAmount.y).coerceIn(-30f, 180f)
+                        rawDragX += dragAmount.x
+                        rawDragY += dragAmount.y
+                        val dampedX = rubberBandDrag(rawDragX, softLimit = skipThresholdPx, maxOverflow = skipThresholdPx * 0.55f)
+                        val dampedY = if (rawDragY < 0f) {
+                            rubberBandDrag(rawDragY, softLimit = 0f, maxOverflow = 24f, stiffnessFactor = 0.02f)
+                        } else {
+                            rubberBandDrag(rawDragY, softLimit = dismissThresholdPx, maxOverflow = dismissThresholdPx * 0.5f)
+                        }
+                        if (!didTriggerThresholdHaptic && (abs(dampedX) >= skipThresholdPx || dampedY >= dismissThresholdPx)) {
+                            didTriggerThresholdHaptic = true
+                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        }
+                        coroutineScope.launch {
+                            offsetX.snapTo(dampedX)
+                            offsetY.snapTo(dampedY)
+                        }
                     }
                 )
             }
@@ -765,6 +824,7 @@ fun MiniPlayer(
                             .size(46.dp)
                             .clip(RoundedCornerShape(12.dp))
                             .background(CarbonElevated)
+                            .border(0.65.dp, ambientPrimary.copy(alpha = 0.4f), RoundedCornerShape(12.dp))
                     )
                 }
 
@@ -779,8 +839,13 @@ fun MiniPlayer(
                         AnimatedContent(
                             targetState = currentTrack.title,
                             transitionSpec = {
-                                (fadeIn(tween(180)) + slideInVertically { it / 3 })
-                                    .togetherWith(fadeOut(tween(130)) + slideOutVertically { -it / 3 })
+                                if (reduceMotion) {
+                                    fadeIn(tween(100)).togetherWith(fadeOut(tween(80)))
+                                } else {
+                                    (fadeIn(tween(200, easing = MotionTokens.EmphasizedDecelerate)) +
+                                        slideInVertically(tween(220, easing = MotionTokens.EmphasizedDecelerate)) { it / 3 })
+                                        .togetherWith(fadeOut(tween(120)) + slideOutVertically { -it / 3 })
+                                }
                             },
                             label = "miniTitleMorph",
                             modifier = Modifier.weight(1f, fill = false)
@@ -798,9 +863,9 @@ fun MiniPlayer(
                     }
                     Spacer(modifier = Modifier.height(2.dp))
                     Text(
-                        text = currentTrack.artist,
+                        text = if (isResolving) "Preparing audio stream..." else currentTrack.artist,
                         style = MaterialTheme.typography.bodySmall,
-                        color = MutedSlate,
+                        color = if (isResolving) ElectricMint.copy(alpha = 0.88f) else MutedSlate,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.fillMaxWidth()
@@ -820,26 +885,33 @@ fun MiniPlayer(
 
                 Spacer(modifier = Modifier.width(6.dp))
 
-                // Solid Mint Primary Play/Pause Button with Tactile Spring Bounce
+                // Principle #1 (Exaggeration) + #4 (Squash & Stretch) + #6 (Doherty Threshold)
                 val miniPlayInteraction = remember { MutableInteractionSource() }
                 val isMiniPlayPressed by miniPlayInteraction.collectIsPressedAsState()
-                val miniPlayScale by animateFloatAsState(
-                    targetValue = if (isMiniPlayPressed) 0.88f else 1f,
-                    animationSpec = spring(
-                        dampingRatio = Spring.DampingRatioMediumBouncy,
-                        stiffness = Spring.StiffnessMedium
-                    ),
-                    label = "miniPlayBounce"
+                val miniPlayScaleX by animateFloatAsState(
+                    targetValue = if (isMiniPlayPressed && !reduceMotion) 1.05f else 1f,
+                    animationSpec = MotionTokens.snappySpring(reduceMotion),
+                    label = "miniPlaySquashX"
+                )
+                val miniPlayScaleY by animateFloatAsState(
+                    targetValue = if (isMiniPlayPressed && !reduceMotion) 0.89f else 1f,
+                    animationSpec = MotionTokens.snappySpring(reduceMotion),
+                    label = "miniPlaySquashY"
+                )
+                val miniPlayCorner by animateDpAsState(
+                    targetValue = if (isPlaying) 13.dp else 21.dp,
+                    animationSpec = MotionTokens.snappySpring(reduceMotion),
+                    label = "miniPlayCornerMorph"
                 )
                 Box(
                     modifier = Modifier
                         .minimumInteractiveComponentSize()
-                        .size(40.dp)
+                        .size(42.dp)
                         .graphicsLayer {
-                            scaleX = miniPlayScale
-                            scaleY = miniPlayScale
+                            scaleX = miniPlayScaleX
+                            scaleY = miniPlayScaleY
                         }
-                        .clip(CircleShape)
+                        .clip(RoundedCornerShape(miniPlayCorner))
                         .background(ElectricMint)
                         .clickable(
                             interactionSource = miniPlayInteraction,
@@ -849,11 +921,19 @@ fun MiniPlayer(
                         .testTag("mini_player_play_pause_button"),
                     contentAlignment = Alignment.Center
                 ) {
-                    AnimatedPlayPauseIcon(
-                        isPlaying = isPlaying,
-                        tint = ThemeOnPrimary,
-                        modifier = Modifier.size(21.dp)
-                    )
+                    if (isResolving) {
+                        CircularProgressIndicator(
+                            color = ThemeOnPrimary,
+                            strokeWidth = 2.2.dp,
+                            modifier = Modifier.size(19.dp)
+                        )
+                    } else {
+                        AnimatedPlayPauseIcon(
+                            isPlaying = isPlaying,
+                            tint = ThemeOnPrimary,
+                            modifier = Modifier.size(21.dp)
+                        )
+                    }
                 }
 
                 Spacer(modifier = Modifier.width(6.dp))
@@ -908,11 +988,16 @@ fun AnimatedPlayPauseIcon(
     tint: Color,
     modifier: Modifier = Modifier
 ) {
+    val reduceMotion = LocalMotionConfig.current.reduceMotion
     AnimatedContent(
         targetState = isPlaying,
         transitionSpec = {
-            (scaleIn(spring(dampingRatio = Spring.DampingRatioMediumBouncy)) + fadeIn(tween(140)))
-                .togetherWith(scaleOut(tween(110)) + fadeOut(tween(110)))
+            if (reduceMotion) {
+                fadeIn(tween(90)).togetherWith(fadeOut(tween(80)))
+            } else {
+                (scaleIn(MotionTokens.tactilePopSpring(false)) + fadeIn(tween(130)))
+                    .togetherWith(scaleOut(tween(100)) + fadeOut(tween(100)))
+            }
         },
         label = "playPauseMorph",
         modifier = modifier
@@ -927,14 +1012,15 @@ fun AnimatedPlayPauseIcon(
 
 /**
  * 100% Seamlessly Looping 4-Bar Mini Waveform Indicator.
- * Only runs infinite transition when `isPlaying == true` so paused states consume zero frame budget.
+ * Only runs infinite transition when `isPlaying == true && !reduceMotion` so paused/reduced-motion states consume zero frame budget.
  */
 @Composable
 fun MiniWaveformIndicator(
     isPlaying: Boolean,
     modifier: Modifier = Modifier
 ) {
-    val phase = if (isPlaying) {
+    val reduceMotion = LocalMotionConfig.current.reduceMotion
+    val phase = if (isPlaying && !reduceMotion) {
         val infiniteTransition = rememberInfiniteTransition(label = "miniSeamlessWave")
         val animatedPhase by infiniteTransition.animateFloat(
             initialValue = 0f,
@@ -952,7 +1038,7 @@ fun MiniWaveformIndicator(
 
     val activeLevel by animateFloatAsState(
         targetValue = if (isPlaying) 1f else 0f,
-        animationSpec = tween(durationMillis = 260),
+        animationSpec = MotionTokens.standardTween(reduceMotion),
         label = "miniWaveActiveLevel"
     )
 
@@ -1048,47 +1134,93 @@ fun ExpandedPlayerSheet(
     var showSleepTimerSheet by remember { mutableStateOf(false) }
     val (ambientPrimary, ambientSecondary) = rememberDynamicArtworkGlow(currentTrack.artworkUrl)
 
+    val reduceMotion = LocalMotionConfig.current.reduceMotion
     val coroutineScope = rememberCoroutineScope()
     val density = LocalDensity.current
     val haptic = LocalHapticFeedback.current
     val sheetDragOffsetY = remember { Animatable(0f) }
-    val collapseThresholdPx = with(density) { 110.dp.toPx() }
+    var rawSheetDragY by remember { mutableFloatStateOf(0f) }
+    val collapseThresholdPx = with(density) { 108.dp.toPx() }
+    val maxUpwardStretchPx = with(density) { 26.dp.toPx() }
     var didTriggerCollapseHaptic by remember { mutableStateOf(false) }
 
     val artworkScale by animateFloatAsState(
         targetValue = if (isPlaying) 1.0f else 0.94f,
-        animationSpec = spring(
-            dampingRatio = Spring.DampingRatioLowBouncy,
-            stiffness = Spring.StiffnessMediumLow
-        ),
+        animationSpec = MotionTokens.fluidSpring(reduceMotion),
         label = "heroArtworkSpring"
     )
 
     val frostedFill = CarbonSurface
     val frostedBorder = SubtleBorder
 
+    // Shared interruptible + rubber-banded vertical sheet drag handler
+    val handleDragStart: () -> Unit = {
+        didTriggerCollapseHaptic = false
+        coroutineScope.launch { sheetDragOffsetY.stop() }
+        rawSheetDragY = sheetDragOffsetY.value
+    }
+    val handleDragDelta: (Float) -> Unit = { dragAmount ->
+        rawSheetDragY += dragAmount
+        val dampedY = if (rawSheetDragY < 0f) {
+            // Principle #5: Rubber Banding upward pull past top stop
+            rubberBandDrag(rawSheetDragY, softLimit = 0f, maxOverflow = maxUpwardStretchPx, stiffnessFactor = 0.016f)
+        } else {
+            rawSheetDragY
+        }
+        coroutineScope.launch { sheetDragOffsetY.snapTo(dampedY) }
+        if (!didTriggerCollapseHaptic && dampedY >= collapseThresholdPx) {
+            didTriggerCollapseHaptic = true
+            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+        }
+    }
+    val handleDragEnd: () -> Unit = {
+        rawSheetDragY = 0f
+        if (sheetDragOffsetY.value >= collapseThresholdPx) {
+            onCollapse()
+        } else {
+            coroutineScope.launch {
+                sheetDragOffsetY.animateTo(
+                    targetValue = 0f,
+                    animationSpec = MotionTokens.fluidSpring(reduceMotion)
+                )
+            }
+        }
+    }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
             .graphicsLayer {
-                translationY = sheetDragOffsetY.value
+                val dy = sheetDragOffsetY.value
+                translationY = dy
+                if (!reduceMotion && dy > 0f) {
+                    // Principle #2 (Origin Awareness) + #17 (Solid Drawing):
+                    // Gently scales & rounds toward the bottom MiniPlayer anchor while pulling down
+                    val progress = (dy / (collapseThresholdPx * 3.2f)).coerceIn(0f, 1f)
+                    val s = 1f - progress * 0.06f
+                    scaleX = s
+                    scaleY = s
+                    transformOrigin = TransformOrigin(0.5f, 0.85f)
+                    clip = true
+                    shape = RoundedCornerShape((progress * 28f).dp)
+                }
             }
             .background(PitchBlack)
             .testTag("expanded_player_sheet")
     ) {
-        // Layer 1: Full-Bleed Blurred Album Cover Art Backdrop + Atmospheric Color Scrim
+        // Layer 1: GPU-Optimized Blurred Album Cover Backdrop (96dp texture cuts blur fill-rate ~14x)
         Box(modifier = Modifier.fillMaxSize()) {
             OptimizedArtworkImage(
                 artworkUrl = currentTrack.artworkUrl,
                 contentDescription = null,
-                targetSizeDp = 360.dp,
+                targetSizeDp = 96.dp,
                 modifier = Modifier
                     .fillMaxSize()
                     .graphicsLayer {
-                        scaleX = 1.32f
-                        scaleY = 1.32f
+                        scaleX = 1.28f
+                        scaleY = 1.28f
                     }
-                    .blur(56.dp)
+                    .blur(32.dp)
             )
 
             val studioPalette = LocalStudioPalette.current
@@ -1099,7 +1231,6 @@ fun ExpandedPlayerSheet(
                 modifier = Modifier
                     .fillMaxSize()
                     .drawBehind {
-                        // Deep atmospheric tint matched to active light/dark studio surface
                         drawRect(
                             brush = Brush.verticalGradient(
                                 colors = listOf(
@@ -1131,44 +1262,13 @@ fun ExpandedPlayerSheet(
                     .fillMaxWidth()
                     .pointerInput(Unit) {
                         detectVerticalDragGestures(
-                            onDragStart = { didTriggerCollapseHaptic = false },
+                            onDragStart = { handleDragStart() },
                             onVerticalDrag = { change, dragAmount ->
-                                if (sheetDragOffsetY.value > 0f || dragAmount > 0f) {
-                                    change.consume()
-                                    val nextY = (sheetDragOffsetY.value + dragAmount).coerceAtLeast(0f)
-                                    coroutineScope.launch { sheetDragOffsetY.snapTo(nextY) }
-                                    if (!didTriggerCollapseHaptic && nextY >= collapseThresholdPx) {
-                                        didTriggerCollapseHaptic = true
-                                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                    }
-                                }
+                                change.consume()
+                                handleDragDelta(dragAmount)
                             },
-                            onDragEnd = {
-                                if (sheetDragOffsetY.value >= collapseThresholdPx) {
-                                    onCollapse()
-                                } else {
-                                    coroutineScope.launch {
-                                        sheetDragOffsetY.animateTo(
-                                            targetValue = 0f,
-                                            animationSpec = spring(
-                                                dampingRatio = Spring.DampingRatioMediumBouncy,
-                                                stiffness = Spring.StiffnessMedium
-                                            )
-                                        )
-                                    }
-                                }
-                            },
-                            onDragCancel = {
-                                coroutineScope.launch {
-                                    sheetDragOffsetY.animateTo(
-                                        targetValue = 0f,
-                                        animationSpec = spring(
-                                            dampingRatio = Spring.DampingRatioMediumBouncy,
-                                            stiffness = Spring.StiffnessMedium
-                                        )
-                                    )
-                                }
-                            }
+                            onDragEnd = { handleDragEnd() },
+                            onDragCancel = { handleDragEnd() }
                         )
                     },
                 verticalAlignment = Alignment.CenterVertically,
@@ -1197,16 +1297,33 @@ fun ExpandedPlayerSheet(
                 ) {
                     ExpandedPlayerTab.entries.forEach { tab ->
                         val isSelected = selectedTab == tab
+                        val tabScale by animateFloatAsState(
+                            targetValue = if (isSelected && !reduceMotion) 1.07f else 1f,
+                            animationSpec = MotionTokens.snappySpring(reduceMotion),
+                            label = "playerTabPillScale"
+                        )
+                        val tabBg by animateColorAsState(
+                            targetValue = if (isSelected) ElectricMint.copy(alpha = 0.16f) else Color.Transparent,
+                            animationSpec = MotionTokens.microTween(reduceMotion),
+                            label = "playerTabPillBg"
+                        )
+                        val tabBorder by animateColorAsState(
+                            targetValue = if (isSelected) ElectricMint else Color.Transparent,
+                            animationSpec = MotionTokens.microTween(reduceMotion),
+                            label = "playerTabPillBorder"
+                        )
                         Box(
                             modifier = Modifier
                                 .size(38.dp)
+                                .graphicsLayer {
+                                    scaleX = tabScale
+                                    scaleY = tabScale
+                                }
                                 .clip(CircleShape)
-                                .background(
-                                    if (isSelected) ElectricMint.copy(alpha = 0.16f) else Color.Transparent
-                                )
+                                .background(tabBg)
                                 .border(
                                     width = if (isSelected) 1.2.dp else 0.dp,
-                                    color = if (isSelected) ElectricMint else Color.Transparent,
+                                    color = tabBorder,
                                     shape = CircleShape
                                 )
                                 .clickable { selectedTab = tab }
@@ -1244,7 +1361,7 @@ fun ExpandedPlayerSheet(
 
             Spacer(modifier = Modifier.height(10.dp))
 
-            // 2. Main Content Area
+            // 2. Main Content Area (Animated tab transitions with Slow In, Slow Out)
             Box(
                 modifier = Modifier
                     .weight(1f)
@@ -1253,44 +1370,13 @@ fun ExpandedPlayerSheet(
                         if (selectedTab == ExpandedPlayerTab.CONTROLS) {
                             Modifier.pointerInput(selectedTab) {
                                 detectVerticalDragGestures(
-                                    onDragStart = { didTriggerCollapseHaptic = false },
+                                    onDragStart = { handleDragStart() },
                                     onVerticalDrag = { change, dragAmount ->
-                                        if (sheetDragOffsetY.value > 0f || dragAmount > 0f) {
-                                            change.consume()
-                                            val nextY = (sheetDragOffsetY.value + dragAmount).coerceAtLeast(0f)
-                                            coroutineScope.launch { sheetDragOffsetY.snapTo(nextY) }
-                                            if (!didTriggerCollapseHaptic && nextY >= collapseThresholdPx) {
-                                                didTriggerCollapseHaptic = true
-                                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                            }
-                                        }
+                                        change.consume()
+                                        handleDragDelta(dragAmount)
                                     },
-                                    onDragEnd = {
-                                        if (sheetDragOffsetY.value >= collapseThresholdPx) {
-                                            onCollapse()
-                                        } else {
-                                            coroutineScope.launch {
-                                                sheetDragOffsetY.animateTo(
-                                                    targetValue = 0f,
-                                                    animationSpec = spring(
-                                                        dampingRatio = Spring.DampingRatioMediumBouncy,
-                                                        stiffness = Spring.StiffnessMedium
-                                                    )
-                                                )
-                                            }
-                                        }
-                                    },
-                                    onDragCancel = {
-                                        coroutineScope.launch {
-                                            sheetDragOffsetY.animateTo(
-                                                targetValue = 0f,
-                                                animationSpec = spring(
-                                                    dampingRatio = Spring.DampingRatioMediumBouncy,
-                                                    stiffness = Spring.StiffnessMedium
-                                                )
-                                            )
-                                        }
-                                    }
+                                    onDragEnd = { handleDragEnd() },
+                                    onDragCancel = { handleDragEnd() }
                                 )
                             }
                         } else {
@@ -1298,55 +1384,80 @@ fun ExpandedPlayerSheet(
                         }
                     )
             ) {
-                when (selectedTab) {
-                    ExpandedPlayerTab.CONTROLS -> {
-                        PlayerControlsTabContent(
-                            currentTrack = currentTrack,
-                            isPlaying = isPlaying,
-                            artworkScale = artworkScale,
-                            currentLyrics = currentLyrics,
-                            currentLyricIndex = currentLyricIndex,
-                            isLyricsLoading = isLyricsLoading,
-                            isDownloaded = isTrackDownloaded,
-                            isDownloading = isTrackDownloading,
-                            frostedFill = frostedFill,
-                            frostedBorder = frostedBorder,
-                            onSkipNext = onSkipNext,
-                            onSkipPrevious = onSkipPrevious,
-                            onOpenLyricsTab = { selectedTab = ExpandedPlayerTab.LYRICS },
-                            onToggleFavorite = { onToggleFavorite(currentTrack) },
-                            onToggleDownload = onToggleDownloadTrack,
-                            onAddToPlaylist = onOpenAddToPlaylist,
-                            onOpenArtist = { onOpenArtist(currentTrack.artist) }
-                        )
-                    }
-                    ExpandedPlayerTab.QUEUE -> {
-                        UpNextQueueTabContent(
-                            queue = queue,
-                            currentTrackId = currentTrack.id,
-                            autoQueuedIds = autoQueuedIds,
-                            isRefillingAutoQueue = isRefillingAutoQueue,
-                            onPlaySong = onPlaySongFromQueue,
-                            onReorderQueue = onReorderQueue,
-                            onRemoveFromQueue = onRemoveFromQueue,
-                            onPlayNextInQueue = onPlayNextInQueue,
-                            onClearUpcomingQueue = onClearUpcomingQueue,
-                            onStartSongRadio = onStartSongRadio,
-                            onSaveQueueAsPlaylist = onSaveQueueAsPlaylist
-                        )
-                    }
-                    ExpandedPlayerTab.LYRICS -> {
-                        SyncedLyricsTabContent(
-                            currentTrack = currentTrack,
-                            ambientPrimary = ambientPrimary,
-                            ambientSecondary = ambientSecondary,
-                            lyricsData = currentLyrics,
-                            currentLyricIndex = currentLyricIndex,
-                            isLoading = isLyricsLoading,
-                            isKaraokeModeEnabled = isKaraokeModeEnabled,
-                            onToggleKaraokeMode = onToggleKaraokeMode,
-                            onSeekToLine = onSeekTo
-                        )
+                AnimatedContent(
+                    targetState = selectedTab,
+                    transitionSpec = {
+                        if (reduceMotion) {
+                            fadeIn(tween(110)).togetherWith(fadeOut(tween(90)))
+                        } else {
+                            val forward = targetState.ordinal >= initialState.ordinal
+                            (fadeIn(tween(MotionTokens.StandardMs, easing = MotionTokens.EmphasizedDecelerate)) +
+                                slideInHorizontally(
+                                    animationSpec = MotionTokens.fluidSpring(false),
+                                    initialOffsetX = { if (forward) it / 8 else -it / 8 }
+                                )).togetherWith(
+                                fadeOut(tween(140)) +
+                                    slideOutHorizontally(
+                                        animationSpec = tween(150, easing = MotionTokens.EmphasizedAccelerate),
+                                        targetOffsetX = { if (forward) -it / 10 else it / 10 }
+                                    )
+                            )
+                        }
+                    },
+                    label = "expandedPlayerTabSwitch",
+                    modifier = Modifier.fillMaxSize()
+                ) { activeTab ->
+                    when (activeTab) {
+                        ExpandedPlayerTab.CONTROLS -> {
+                            PlayerControlsTabContent(
+                                currentTrack = currentTrack,
+                                isPlaying = isPlaying,
+                                artworkScale = artworkScale,
+                                currentLyrics = currentLyrics,
+                                currentLyricIndex = currentLyricIndex,
+                                isLyricsLoading = isLyricsLoading,
+                                isDownloaded = isTrackDownloaded,
+                                isDownloading = isTrackDownloading,
+                                frostedFill = frostedFill,
+                                frostedBorder = frostedBorder,
+                                onSkipNext = onSkipNext,
+                                onSkipPrevious = onSkipPrevious,
+                                onOpenLyricsTab = { selectedTab = ExpandedPlayerTab.LYRICS },
+                                onToggleFavorite = { onToggleFavorite(currentTrack) },
+                                onToggleDownload = onToggleDownloadTrack,
+                                onAddToPlaylist = onOpenAddToPlaylist,
+                                onOpenArtist = { onOpenArtist(currentTrack.artist) }
+                            )
+                        }
+                        ExpandedPlayerTab.QUEUE -> {
+                            UpNextQueueTabContent(
+                                queue = queue,
+                                currentTrackId = currentTrack.id,
+                                isPlaying = isPlaying,
+                                autoQueuedIds = autoQueuedIds,
+                                isRefillingAutoQueue = isRefillingAutoQueue,
+                                onPlaySong = onPlaySongFromQueue,
+                                onReorderQueue = onReorderQueue,
+                                onRemoveFromQueue = onRemoveFromQueue,
+                                onPlayNextInQueue = onPlayNextInQueue,
+                                onClearUpcomingQueue = onClearUpcomingQueue,
+                                onStartSongRadio = onStartSongRadio,
+                                onSaveQueueAsPlaylist = onSaveQueueAsPlaylist
+                            )
+                        }
+                        ExpandedPlayerTab.LYRICS -> {
+                            SyncedLyricsTabContent(
+                                currentTrack = currentTrack,
+                                ambientPrimary = ambientPrimary,
+                                ambientSecondary = ambientSecondary,
+                                lyricsData = currentLyrics,
+                                currentLyricIndex = currentLyricIndex,
+                                isLoading = isLyricsLoading,
+                                isKaraokeModeEnabled = isKaraokeModeEnabled,
+                                onToggleKaraokeMode = onToggleKaraokeMode,
+                                onSeekToLine = onSeekTo
+                            )
+                        }
                     }
                 }
             }
@@ -1404,8 +1515,12 @@ private fun FrostedGlassCircleIconButton(
     activeTint: Color = Color.Unspecified,
     inactiveTint: Color = Color.Unspecified,
     containerColor: Color = Color.Unspecified,
-    borderColor: Color = Color.Unspecified
+    borderColor: Color = Color.Unspecified,
+    anticipationDirection: Float = 0f
 ) {
+    val reduceMotion = LocalMotionConfig.current.reduceMotion
+    val coroutineScope = rememberCoroutineScope()
+    val density = LocalDensity.current
     val resolvedActiveTint = activeTint.takeOrElse { ElectricMint }
     val resolvedInactiveTint = inactiveTint.takeOrElse { AlabasterWhite }
     val baseContainer = containerColor.takeOrElse { CarbonSurface }
@@ -1413,40 +1528,49 @@ private fun FrostedGlassCircleIconButton(
 
     val animatedBg by animateColorAsState(
         targetValue = if (isActive) resolvedActiveTint.copy(alpha = 0.16f) else baseContainer,
-        animationSpec = tween(180),
+        animationSpec = MotionTokens.microTween(reduceMotion),
         label = "frostedCircleBg"
     )
     val animatedBorder by animateColorAsState(
         targetValue = if (isActive) resolvedActiveTint.copy(alpha = 0.75f) else baseBorder,
-        animationSpec = tween(180),
+        animationSpec = MotionTokens.microTween(reduceMotion),
         label = "frostedCircleBorder"
     )
     val animatedTint by animateColorAsState(
         targetValue = if (isActive) resolvedActiveTint else resolvedInactiveTint,
-        animationSpec = tween(180),
+        animationSpec = MotionTokens.microTween(reduceMotion),
         label = "frostedCircleTint"
     )
     val interactionSource = remember { MutableInteractionSource() }
     val isPressed by interactionSource.collectIsPressedAsState()
-    val buttonScale by animateFloatAsState(
+    // Principle #4 (Squash & Stretch) + #7 (Anticipation)
+    val buttonScaleX by animateFloatAsState(
         targetValue = when {
-            isPressed -> 0.88f
-            isActive -> 1.04f
+            isPressed && !reduceMotion -> 1.045f
+            isActive && !reduceMotion -> 1.04f
             else -> 1f
         },
-        animationSpec = spring(
-            dampingRatio = Spring.DampingRatioMediumBouncy,
-            stiffness = Spring.StiffnessMedium
-        ),
-        label = "frostedCircleScale"
+        animationSpec = MotionTokens.snappySpring(reduceMotion),
+        label = "frostedCircleScaleX"
     )
+    val buttonScaleY by animateFloatAsState(
+        targetValue = when {
+            isPressed && !reduceMotion -> 0.89f
+            isActive && !reduceMotion -> 1.04f
+            else -> 1f
+        },
+        animationSpec = MotionTokens.snappySpring(reduceMotion),
+        label = "frostedCircleScaleY"
+    )
+    val iconNudgeX = remember { Animatable(0f) }
 
     Box(
         modifier = modifier
+            .minimumInteractiveComponentSize()
             .size(size)
             .graphicsLayer {
-                scaleX = buttonScale
-                scaleY = buttonScale
+                scaleX = buttonScaleX
+                scaleY = buttonScaleY
             }
             .clip(CircleShape)
             .background(animatedBg)
@@ -1458,15 +1582,31 @@ private fun FrostedGlassCircleIconButton(
             .clickable(
                 interactionSource = interactionSource,
                 indication = null,
-                onClick = onClick
+                onClick = {
+                    if (anticipationDirection != 0f && !reduceMotion) {
+                        val pullPx = with(density) { -3.5.dp.toPx() } * anticipationDirection
+                        val thrustPx = with(density) { 5.5.dp.toPx() } * anticipationDirection
+                        coroutineScope.launch {
+                            iconNudgeX.stop()
+                            iconNudgeX.animateTo(pullPx, tween(55))
+                            iconNudgeX.animateTo(thrustPx, MotionTokens.snappySpring(false))
+                            iconNudgeX.animateTo(0f, MotionTokens.fluidSpring(false))
+                        }
+                    }
+                    onClick()
+                }
             ),
         contentAlignment = Alignment.Center
     ) {
         AnimatedContent(
             targetState = icon,
             transitionSpec = {
-                (scaleIn(spring(dampingRatio = Spring.DampingRatioMediumBouncy)) + fadeIn(tween(140)))
-                    .togetherWith(scaleOut(tween(110)) + fadeOut(tween(110)))
+                if (reduceMotion) {
+                    fadeIn(tween(90)).togetherWith(fadeOut(tween(80)))
+                } else {
+                    (scaleIn(MotionTokens.tactilePopSpring(false)) + fadeIn(tween(130)))
+                        .togetherWith(scaleOut(tween(100)) + fadeOut(tween(100)))
+                }
             },
             label = "frostedCircleIconMorph"
         ) { targetIcon ->
@@ -1474,7 +1614,11 @@ private fun FrostedGlassCircleIconButton(
                 imageVector = targetIcon,
                 contentDescription = contentDescription,
                 tint = animatedTint,
-                modifier = Modifier.size(iconSize)
+                modifier = Modifier
+                    .size(iconSize)
+                    .graphicsLayer {
+                        translationX = iconNudgeX.value
+                    }
             )
         }
     }
@@ -1500,12 +1644,35 @@ private fun PlayerControlsTabContent(
     onAddToPlaylist: () -> Unit,
     onOpenArtist: () -> Unit
 ) {
+    val reduceMotion = LocalMotionConfig.current.reduceMotion
     val coroutineScope = rememberCoroutineScope()
     val haptic = LocalHapticFeedback.current
+    val density = LocalDensity.current
     val artworkOffsetX = remember(currentTrack.id) { Animatable(0f) }
-    val skipThresholdPx = with(LocalDensity.current) { 76.dp.toPx() }
+    var rawArtworkDragX by remember(currentTrack.id) { mutableFloatStateOf(0f) }
+    val skipThresholdPx = with(density) { 74.dp.toPx() }
+    val arcLiftPx = with(density) { 14.dp.toPx() }
     var didTriggerSkipHaptic by remember(currentTrack.id) { mutableStateOf(false) }
     val hasLyricsSlot = isLyricsLoading || (currentLyrics != null && currentLyrics.lines.isNotEmpty())
+
+    // Principle #11 (Follow-Through): Metadata settles ~38ms behind hero artwork on track change
+    val metadataFollowOffset = remember(currentTrack.id) { Animatable(if (reduceMotion) 0f else 18f) }
+    val metadataFollowAlpha = remember(currentTrack.id) { Animatable(if (reduceMotion) 1f else 0.25f) }
+    LaunchedEffect(currentTrack.id, reduceMotion) {
+        if (reduceMotion) {
+            metadataFollowOffset.snapTo(0f)
+            metadataFollowAlpha.snapTo(1f)
+        } else {
+            delay(36L)
+            launch {
+                metadataFollowOffset.animateTo(0f, MotionTokens.fluidSpring(false))
+            }
+            metadataFollowAlpha.animateTo(
+                1f,
+                tween(durationMillis = MotionTokens.StandardMs, easing = MotionTokens.EmphasizedDecelerate)
+            )
+        }
+    }
 
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
         val reservedBelowArt = if (hasLyricsSlot) 166.dp else 96.dp
@@ -1517,7 +1684,7 @@ private fun PlayerControlsTabContent(
         ) {
             Spacer(modifier = Modifier.height(6.dp))
 
-            // 1. Rounded Square Album Art with Soft Drop Shadow & Swipe Left/Right to Skip
+            // 1. Hero Album Art: Arcs (#12) + Solid Drawing 3D Depth (#17) + Rubber Banding (#5) + Interruptible (#15)
             Box(
                 modifier = Modifier
                     .widthIn(max = maxArtSide)
@@ -1526,19 +1693,28 @@ private fun PlayerControlsTabContent(
                     .padding(2.dp)
                     .pointerInput(currentTrack.id) {
                         detectHorizontalDragGestures(
-                            onDragStart = { didTriggerSkipHaptic = false },
+                            onDragStart = {
+                                didTriggerSkipHaptic = false
+                                coroutineScope.launch { artworkOffsetX.stop() }
+                                rawArtworkDragX = artworkOffsetX.value
+                            },
                             onHorizontalDrag = { change, dragAmount ->
                                 change.consume()
-                                val nextX = (artworkOffsetX.value + dragAmount)
-                                    .coerceIn(-skipThresholdPx * 1.85f, skipThresholdPx * 1.85f)
-                                coroutineScope.launch { artworkOffsetX.snapTo(nextX) }
-                                if (!didTriggerSkipHaptic && abs(nextX) >= skipThresholdPx) {
+                                rawArtworkDragX += dragAmount
+                                val dampedX = rubberBandDrag(
+                                    rawOffset = rawArtworkDragX,
+                                    softLimit = skipThresholdPx,
+                                    maxOverflow = skipThresholdPx * 0.72f
+                                )
+                                coroutineScope.launch { artworkOffsetX.snapTo(dampedX) }
+                                if (!didTriggerSkipHaptic && abs(dampedX) >= skipThresholdPx) {
                                     didTriggerSkipHaptic = true
                                     haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                 }
                             },
                             onDragEnd = {
                                 val finalX = artworkOffsetX.value
+                                rawArtworkDragX = 0f
                                 if (finalX <= -skipThresholdPx) {
                                     onSkipNext()
                                 } else if (finalX >= skipThresholdPx) {
@@ -1547,32 +1723,35 @@ private fun PlayerControlsTabContent(
                                 coroutineScope.launch {
                                     artworkOffsetX.animateTo(
                                         targetValue = 0f,
-                                        animationSpec = spring(
-                                            dampingRatio = Spring.DampingRatioMediumBouncy,
-                                            stiffness = Spring.StiffnessMedium
-                                        )
+                                        animationSpec = MotionTokens.fluidSpring(reduceMotion)
                                     )
                                 }
                             },
                             onDragCancel = {
+                                rawArtworkDragX = 0f
                                 coroutineScope.launch {
                                     artworkOffsetX.animateTo(
                                         targetValue = 0f,
-                                        animationSpec = spring(
-                                            dampingRatio = Spring.DampingRatioMediumBouncy,
-                                            stiffness = Spring.StiffnessMedium
-                                        )
+                                        animationSpec = MotionTokens.fluidSpring(reduceMotion)
                                     )
                                 }
                             }
                         )
                     }
                     .graphicsLayer {
+                        val dx = artworkOffsetX.value
+                        val normX = (dx / skipThresholdPx).coerceIn(-1.6f, 1.6f)
                         scaleX = artworkScale
                         scaleY = artworkScale
-                        translationX = artworkOffsetX.value
-                        rotationZ = (artworkOffsetX.value / skipThresholdPx).coerceIn(-1.5f, 1.5f) * 3.5f
-                        alpha = (1f - (abs(artworkOffsetX.value) / (skipThresholdPx * 3f))).coerceIn(0.65f, 1f)
+                        translationX = dx
+                        if (!reduceMotion) {
+                            // Principle #12: Curved Pendulum Arc + Principle #17: Solid Drawing 3D tilt
+                            translationY = -abs(normX).coerceAtMost(1.2f) * arcLiftPx
+                            rotationZ = normX * 4.8f
+                            rotationY = normX * 7.5f
+                            cameraDistance = 14f * density.density
+                        }
+                        alpha = (1f - (abs(dx) / (skipThresholdPx * 3.2f))).coerceIn(0.68f, 1f)
                     }
                     .shadow(32.dp, RoundedCornerShape(24.dp))
                     .clip(RoundedCornerShape(24.dp))
@@ -1588,7 +1767,7 @@ private fun PlayerControlsTabContent(
                 )
             }
 
-            // 1.5. Compact Live Lyrics Preview Pill (Tap to open full Lyrics tab)
+            // 1.5. Compact Live Lyrics Preview Pill (Follow-Through settle)
             if (hasLyricsSlot) {
                 Spacer(modifier = Modifier.height(12.dp))
                 LiveLyricsPreviewPill(
@@ -1596,15 +1775,23 @@ private fun PlayerControlsTabContent(
                     currentLyricIndex = currentLyricIndex,
                     isLoading = isLyricsLoading,
                     isPlaying = isPlaying,
-                    onClick = onOpenLyricsTab
+                    onClick = onOpenLyricsTab,
+                    modifier = Modifier.graphicsLayer {
+                        translationY = metadataFollowOffset.value * 0.65f
+                        alpha = metadataFollowAlpha.value
+                    }
                 )
             }
 
-            // 2. Song Title, Artist Link & 3 Circular Action Buttons Centered Vertically Between Artwork/Lyrics & Progress Bar
+            // 2. Song Title, Artist Link & 3 Circular Action Buttons (Follow-Through settle)
             Box(
                 modifier = Modifier
                     .weight(1f)
-                    .fillMaxWidth(),
+                    .fillMaxWidth()
+                    .graphicsLayer {
+                        translationY = metadataFollowOffset.value
+                        alpha = metadataFollowAlpha.value
+                    },
                 contentAlignment = Alignment.Center
             ) {
                 Row(
@@ -1713,29 +1900,18 @@ private fun PlayerControlsTabContent(
                             )
                         }
 
-                        Box(
-                            modifier = Modifier
-                                .size(44.dp)
-                                .clip(CircleShape)
-                                .background(
-                                    if (currentTrack.isFavorite) SunsetCoral.copy(alpha = 0.22f) else frostedFill
-                                )
-                                .border(
-                                    width = 0.85.dp,
-                                    color = if (currentTrack.isFavorite) SunsetCoral.copy(alpha = 0.7f) else frostedBorder,
-                                    shape = CircleShape
-                                )
-                                .clickable(onClick = onToggleFavorite)
-                                .testTag("expanded_favorite_button"),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(
-                                imageVector = if (currentTrack.isFavorite) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
-                                contentDescription = "Favorite",
-                                tint = if (currentTrack.isFavorite) SunsetCoral else AlabasterWhite,
-                                modifier = Modifier.size(20.dp)
-                            )
-                        }
+                        // Upgraded with full Anticipation + Exaggeration + 8-dot Secondary Action shimmer burst
+                        AnimatedFavoriteButton(
+                            isFavorite = currentTrack.isFavorite,
+                            onClick = onToggleFavorite,
+                            contentDescription = "Favorite",
+                            size = 44.dp,
+                            iconSize = 20.dp,
+                            activeTint = SunsetCoral,
+                            inactiveTint = AlabasterWhite,
+                            containerColor = frostedFill,
+                            modifier = Modifier.testTag("expanded_favorite_button")
+                        )
                     }
                 }
             }
@@ -1879,28 +2055,38 @@ fun InteractiveWaveformProgressBar(
     onSeekTo: (Long) -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val reduceMotion = LocalMotionConfig.current.reduceMotion
+    val haptic = LocalHapticFeedback.current
     var isScrubbing by remember { mutableStateOf(false) }
     var scrubFraction by remember { mutableFloatStateOf(0f) }
 
-    // Seamless [0, 2π] phase animation with exact integer harmonics
-    val infiniteTransition = rememberInfiniteTransition(label = "seamlessWaveformScrubber")
-    val phase by infiniteTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = TWO_PI_FLOAT,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 2400, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "seamlessPhase"
-    )
+    // Zero-Lag Idle Gating: only run infinite harmonic transition when playing & motion is enabled
+    val phase = if (isPlaying && !reduceMotion) {
+        val infiniteTransition = rememberInfiniteTransition(label = "seamlessWaveformScrubber")
+        val animatedPhase by infiniteTransition.animateFloat(
+            initialValue = 0f,
+            targetValue = TWO_PI_FLOAT,
+            animationSpec = infiniteRepeatable(
+                animation = tween(durationMillis = 2400, easing = LinearEasing),
+                repeatMode = RepeatMode.Restart
+            ),
+            label = "seamlessPhase"
+        )
+        animatedPhase
+    } else {
+        0.6f
+    }
 
     val dynamicAmplitude by animateFloatAsState(
-        targetValue = if (isPlaying) 1.0f else 0.0f,
-        animationSpec = spring(
-            dampingRatio = Spring.DampingRatioNoBouncy,
-            stiffness = Spring.StiffnessLow
-        ),
+        targetValue = if (isPlaying && !reduceMotion) 1.0f else 0.0f,
+        animationSpec = MotionTokens.gentleSpring(reduceMotion),
         label = "dynamicWaveAmplitude"
+    )
+
+    val scrubContainerScale by animateFloatAsState(
+        targetValue = if (isScrubbing && !reduceMotion) 1.015f else 1f,
+        animationSpec = MotionTokens.snappySpring(reduceMotion),
+        label = "scrubContainerScale"
     )
 
     // Deterministic per-track acoustic profile (44 bars)
@@ -1938,96 +2124,156 @@ fun InteractiveWaveformProgressBar(
         modifier = modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(54.dp)
-                .clip(RoundedCornerShape(20.dp))
-                .background(CarbonSurface.copy(alpha = 0.72f))
-                .border(
-                    width = 0.85.dp,
-                    color = if (isScrubbing) ElectricMint.copy(alpha = 0.65f) else SubtleBorder,
-                    shape = RoundedCornerShape(20.dp)
-                )
-                .padding(horizontal = 14.dp, vertical = 7.dp)
-                .pointerInput(trackId) {
-                    detectTapGestures { offset ->
-                        val widthPx = size.width.coerceAtLeast(1)
-                        val tappedFraction = (offset.x / widthPx.toFloat()).coerceIn(0f, 1f)
-                        val safeDur = durationProvider().coerceAtLeast(1L)
-                        onSeekTo((tappedFraction * safeDur.toFloat()).toLong())
+        BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+            val containerWidthPx = with(LocalDensity.current) { maxWidth.toPx() }
+            val safeDur = durationProvider().coerceAtLeast(1L)
+            val scrubPreviewMs = (scrubFraction * safeDur.toFloat()).toLong()
+
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(56.dp) // Principle #8 (Fitts's Law): generous thumb scrubbing hit zone
+                    .graphicsLayer {
+                        scaleX = scrubContainerScale
+                        scaleY = scrubContainerScale
                     }
-                }
-                .pointerInput(trackId) {
-                    detectHorizontalDragGestures(
-                        onDragStart = { startOffset ->
+                    .clip(RoundedCornerShape(20.dp))
+                    .background(CarbonSurface.copy(alpha = 0.72f))
+                    .border(
+                        width = if (isScrubbing) 1.15.dp else 0.85.dp,
+                        color = if (isScrubbing) ElectricMint.copy(alpha = 0.75f) else SubtleBorder,
+                        shape = RoundedCornerShape(20.dp)
+                    )
+                    .padding(horizontal = 14.dp, vertical = 7.dp)
+                    .pointerInput(trackId) {
+                        detectTapGestures { offset ->
                             val widthPx = size.width.coerceAtLeast(1)
-                            isScrubbing = true
-                            scrubFraction = (startOffset.x / widthPx.toFloat()).coerceIn(0f, 1f)
-                        },
-                        onHorizontalDrag = { change, _ ->
-                            change.consume()
-                            val widthPx = size.width.coerceAtLeast(1)
-                            scrubFraction = (change.position.x / widthPx.toFloat()).coerceIn(0f, 1f)
-                        },
-                        onDragEnd = {
-                            val safeDur = durationProvider().coerceAtLeast(1L)
-                            onSeekTo((scrubFraction * safeDur.toFloat()).toLong())
-                            isScrubbing = false
-                        },
-                        onDragCancel = {
-                            isScrubbing = false
+                            val tappedFraction = (offset.x / widthPx.toFloat()).coerceIn(0f, 1f)
+                            val dur = durationProvider().coerceAtLeast(1L)
+                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            onSeekTo((tappedFraction * dur.toFloat()).toLong())
                         }
-                    )
-                }
-                .testTag("player_seek_slider")
-        ) {
-            Canvas(modifier = Modifier.fillMaxSize()) {
-                val safeDur = durationProvider().coerceAtLeast(1L)
-                val liveFraction = (progressProvider().coerceIn(0L, safeDur).toFloat() / safeDur.toFloat())
-                    .coerceIn(0f, 1f)
-                val displayFraction = if (isScrubbing) scrubFraction else liveFraction
+                    }
+                    .pointerInput(trackId) {
+                        detectHorizontalDragGestures(
+                            onDragStart = { startOffset ->
+                                val widthPx = size.width.coerceAtLeast(1)
+                                isScrubbing = true
+                                scrubFraction = (startOffset.x / widthPx.toFloat()).coerceIn(0f, 1f)
+                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            },
+                            onHorizontalDrag = { change, _ ->
+                                change.consume()
+                                val widthPx = size.width.coerceAtLeast(1)
+                                scrubFraction = (change.position.x / widthPx.toFloat()).coerceIn(0f, 1f)
+                            },
+                            onDragEnd = {
+                                val dur = durationProvider().coerceAtLeast(1L)
+                                onSeekTo((scrubFraction * dur.toFloat()).toLong())
+                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                isScrubbing = false
+                            },
+                            onDragCancel = {
+                                isScrubbing = false
+                            }
+                        )
+                    }
+                    .testTag("player_seek_slider")
+            ) {
+                Canvas(modifier = Modifier.fillMaxSize()) {
+                    val dur = durationProvider().coerceAtLeast(1L)
+                    val liveFraction = (progressProvider().coerceIn(0L, dur).toFloat() / dur.toFloat())
+                        .coerceIn(0f, 1f)
+                    val displayFraction = if (isScrubbing) scrubFraction else liveFraction
 
-                val totalBars = barCount
-                val spacingRatio = 0.42f
-                val totalSpacing = size.width * spacingRatio
-                val barWidth = ((size.width - totalSpacing) / totalBars).coerceAtLeast(2.5.dp.toPx())
-                val gap = totalSpacing / (totalBars - 1).coerceAtLeast(1)
-                val playheadX = size.width * displayFraction
+                    val totalBars = barCount
+                    val spacingRatio = 0.42f
+                    val totalSpacing = size.width * spacingRatio
+                    val barWidth = ((size.width - totalSpacing) / totalBars).coerceAtLeast(2.5.dp.toPx())
+                    val gap = totalSpacing / (totalBars - 1).coerceAtLeast(1)
+                    val playheadX = size.width * displayFraction
 
-                for (i in 0 until totalBars) {
-                    val h1 = sin(1f * phase + i * 0.44f)
-                    val h2 = cos(2f * phase - i * 0.71f)
-                    val h3 = sin(3f * phase + i * 1.13f)
-                    val harmonicWave = (h1 * 0.48f + h2 * 0.34f + h3 * 0.18f)
+                    for (i in 0 until totalBars) {
+                        val h1 = sin(1f * phase + i * 0.44f)
+                        val h2 = cos(2f * phase - i * 0.71f)
+                        val h3 = sin(3f * phase + i * 1.13f)
+                        val harmonicWave = (h1 * 0.48f + h2 * 0.34f + h3 * 0.18f)
 
-                    val baseHeight = baseProfile[i]
-                    val animatedHeight = (baseHeight + harmonicWave * 0.24f * dynamicAmplitude)
-                        .coerceIn(0.18f, 0.96f)
+                        val baseHeight = baseProfile[i]
+                        val animatedHeight = (baseHeight + harmonicWave * 0.24f * dynamicAmplitude)
+                            .coerceIn(0.18f, 0.96f)
 
-                    val barHeight = (size.height * animatedHeight).coerceAtLeast(5.dp.toPx())
-                    val x = i * (barWidth + gap)
-                    val y = (size.height - barHeight) / 2f
-                    val barCenterX = x + barWidth / 2f
-                    val isBarPlayed = barCenterX <= playheadX
+                        val barHeight = (size.height * animatedHeight).coerceAtLeast(5.dp.toPx())
+                        val x = i * (barWidth + gap)
+                        val y = (size.height - barHeight) / 2f
+                        val barCenterX = x + barWidth / 2f
+                        val isBarPlayed = barCenterX <= playheadX
 
+                        drawRoundRect(
+                            brush = if (isBarPlayed) playedBrush else unplayedBrush,
+                            topLeft = Offset(x, y),
+                            size = Size(barWidth, barHeight),
+                            cornerRadius = CornerRadius(barWidth / 2f, barWidth / 2f)
+                        )
+                    }
+
+                    // Crisp Vertical Playhead Bar (thickens during active scrub)
+                    val pillWidth = if (isScrubbing) 4.5.dp.toPx() else 3.dp.toPx()
+                    val clampedX = playheadX.coerceIn(pillWidth / 2f, size.width - pillWidth / 2f)
+                    if (isScrubbing) {
+                        drawRoundRect(
+                            color = waveAccent.copy(alpha = 0.32f),
+                            topLeft = Offset(clampedX - pillWidth * 1.1f, 0f),
+                            size = Size(pillWidth * 2.2f, size.height),
+                            cornerRadius = CornerRadius(pillWidth, pillWidth)
+                        )
+                    }
                     drawRoundRect(
-                        brush = if (isBarPlayed) playedBrush else unplayedBrush,
-                        topLeft = Offset(x, y),
-                        size = Size(barWidth, barHeight),
-                        cornerRadius = CornerRadius(barWidth / 2f, barWidth / 2f)
+                        color = playheadColor,
+                        topLeft = Offset(clampedX - pillWidth / 2f, 0f),
+                        size = Size(pillWidth, size.height),
+                        cornerRadius = CornerRadius(pillWidth / 2f, pillWidth / 2f)
                     )
                 }
+            }
 
-                // Crisp Vertical Playhead Bar
-                val pillWidth = if (isScrubbing) 4.dp.toPx() else 3.dp.toPx()
-                val clampedX = playheadX.coerceIn(pillWidth / 2f, size.width - pillWidth / 2f)
-                drawRoundRect(
-                    color = playheadColor,
-                    topLeft = Offset(clampedX - pillWidth / 2f, 0f),
-                    size = Size(pillWidth, size.height),
-                    cornerRadius = CornerRadius(pillWidth / 2f, pillWidth / 2f)
-                )
+            // Principle #16 (Secondary Action): Elevated live scrub timestamp badge tracking thumb X
+            androidx.compose.animation.AnimatedVisibility(
+                visible = isScrubbing,
+                enter = if (reduceMotion) fadeIn(tween(90)) else scaleIn(
+                    initialScale = 0.8f,
+                    transformOrigin = TransformOrigin(0.5f, 1f),
+                    animationSpec = MotionTokens.snappySpring(false)
+                ) + fadeIn(tween(110)),
+                exit = if (reduceMotion) fadeOut(tween(80)) else scaleOut(
+                    targetScale = 0.82f,
+                    animationSpec = tween(100)
+                ) + fadeOut(tween(100)),
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .graphicsLayer {
+                        val badgeHalfPx = 30.dp.toPx()
+                        val targetX = (containerWidthPx * scrubFraction - badgeHalfPx)
+                            .coerceIn(4.dp.toPx(), (containerWidthPx - badgeHalfPx * 2f - 4.dp.toPx()).coerceAtLeast(4f))
+                        translationX = targetX
+                        translationY = -30.dp.toPx()
+                    }
+            ) {
+                Surface(
+                    color = ElectricMint,
+                    shape = RoundedCornerShape(50),
+                    shadowElevation = 8.dp
+                ) {
+                    Text(
+                        text = formatDurationTimestamp(scrubPreviewMs),
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            fontFamily = JetBrainsMonoFontFamily,
+                            fontWeight = FontWeight.ExtraBold
+                        ),
+                        color = ThemeOnPrimary,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                    )
+                }
             }
         }
 
@@ -2092,6 +2338,7 @@ private fun WaveformTimestampsRow(
 private fun UpNextQueueTabContent(
     queue: List<SongItem>,
     currentTrackId: String,
+    isPlaying: Boolean = true,
     autoQueuedIds: Set<String> = emptySet(),
     isRefillingAutoQueue: Boolean = false,
     onPlaySong: (SongItem) -> Unit,
@@ -2102,6 +2349,7 @@ private fun UpNextQueueTabContent(
     onStartSongRadio: () -> Unit = {},
     onSaveQueueAsPlaylist: (String) -> Unit = {}
 ) {
+    val reduceMotion = LocalMotionConfig.current.reduceMotion
     val listState = rememberLazyListState()
     val haptic = LocalHapticFeedback.current
     var draggedItemKey by remember { mutableStateOf<String?>(null) }
@@ -2251,6 +2499,17 @@ private fun UpNextQueueTabContent(
         val renderQueueRow: @Composable (SongItem, Boolean) -> Unit = { song, isAutoGenerated ->
             val isCurrent = song.id == currentTrackId
             val isDragged = draggedItemKey == song.id
+            // Principle #11 (Follow-Through) + #17 (Solid Drawing): weighted spring lift & settle on drag
+            val rowDragScale by animateFloatAsState(
+                targetValue = if (isDragged && !reduceMotion) 1.028f else 1f,
+                animationSpec = MotionTokens.snappySpring(reduceMotion),
+                label = "queueRowDragScale"
+            )
+            val rowShadowElevation by animateFloatAsState(
+                targetValue = if (isDragged) 18f else 0f,
+                animationSpec = MotionTokens.microTween(reduceMotion),
+                label = "queueRowDragElevation"
+            )
             val dismissState = rememberSwipeToDismissBoxState(
                 confirmValueChange = { value ->
                     if (draggedItemKey == null && value == SwipeToDismissBoxValue.EndToStart) {
@@ -2271,8 +2530,9 @@ private fun UpNextQueueTabContent(
                     .zIndex(if (isDragged) 2f else 0f)
                     .graphicsLayer {
                         translationY = if (isDragged) dragDeltaY else 0f
-                        scaleX = if (isDragged) 1.02f else 1f
-                        scaleY = if (isDragged) 1.02f else 1f
+                        scaleX = rowDragScale
+                        scaleY = rowDragScale
+                        shadowElevation = rowShadowElevation
                     }
             ) {
                 SwipeToDismissBox(
@@ -2342,7 +2602,7 @@ private fun UpNextQueueTabContent(
                                         .background(PhotoScrimColor.copy(alpha = 0.52f)),
                                     contentAlignment = Alignment.Center
                                 ) {
-                                    MiniWaveformIndicator(isPlaying = true)
+                                    MiniWaveformIndicator(isPlaying = isPlaying)
                                 }
                             }
                         }
@@ -2948,22 +3208,34 @@ private fun SyncedLyricsTabContent(
                         ) { index, line ->
                             val displayedLine = line.text
                             if (activeIsSynced) {
+                                val reduceMotion = LocalMotionConfig.current.reduceMotion
                                 val isActive = index == effectiveCurrentIndex
                                 val isPassed = effectiveCurrentIndex >= 0 && index < effectiveCurrentIndex
 
+                                // Principle #13 (Von Restorff Effect) + #9 (Slow In, Slow Out)
                                 val lineColor by animateColorAsState(
                                     targetValue = when {
                                         isActive -> ElectricMint
-                                        isPassed -> AlabasterWhite.copy(alpha = 0.62f)
-                                        else -> AlabasterWhite.copy(alpha = 0.42f)
+                                        isPassed -> AlabasterWhite.copy(alpha = 0.58f)
+                                        else -> AlabasterWhite.copy(alpha = 0.36f)
                                     },
-                                    animationSpec = tween(180),
+                                    animationSpec = MotionTokens.standardTween(reduceMotion),
                                     label = "lyricColor"
+                                )
+                                val lyricFocusScale by animateFloatAsState(
+                                    targetValue = if (isActive && !reduceMotion) 1.035f else 1.0f,
+                                    animationSpec = MotionTokens.fluidSpring(reduceMotion),
+                                    label = "lyricFocusScale"
                                 )
 
                                 Box(
                                     modifier = Modifier
                                         .fillMaxWidth()
+                                        .graphicsLayer {
+                                            scaleX = lyricFocusScale
+                                            scaleY = lyricFocusScale
+                                            transformOrigin = TransformOrigin(0f, 0.5f)
+                                        }
                                         .clip(RoundedCornerShape(14.dp))
                                         .background(
                                             if (isActive) ElectricMint.copy(alpha = 0.14f) else Color.Transparent
@@ -3728,6 +4000,7 @@ private fun PlayerTransportSection(
     onToggleShuffle: () -> Unit,
     onCycleRepeat: () -> Unit
 ) {
+    val reduceMotion = LocalMotionConfig.current.reduceMotion
     Column(modifier = Modifier.fillMaxWidth()) {
         // Unified Interactive Pill-Enclosed Waveform Scrubber
         InteractiveWaveformProgressBar(
@@ -3740,7 +4013,7 @@ private fun PlayerTransportSection(
 
         Spacer(modifier = Modifier.height(8.dp))
 
-        // Frosted Glass Circular Transport Controls + Glowing Green Play Button
+        // Principle #8 (Fitts's Law) + #7 (Anticipation) + #1 (Exaggeration) + #4 (Squash & Stretch) + #13 (Von Restorff)
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -3769,25 +4042,34 @@ private fun PlayerTransportSection(
                 containerColor = frostedFill,
                 borderColor = frostedBorder,
                 inactiveTint = AlabasterWhite,
+                anticipationDirection = -1f,
                 modifier = Modifier.testTag("player_previous_button")
             )
 
             val playBtnSize by animateDpAsState(
                 targetValue = if (isPlaying) 70.dp else 68.dp,
-                animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy),
+                animationSpec = MotionTokens.snappySpring(reduceMotion),
                 label = "playBtnSize"
+            )
+            // Principle #1 (Exaggeration): Play/Pause unmistakably morphs between Circle <-> Rounded Squircle
+            val playBtnCorner by animateDpAsState(
+                targetValue = if (isPlaying) 22.dp else 35.dp,
+                animationSpec = MotionTokens.fluidSpring(reduceMotion),
+                label = "playBtnCornerMorph"
             )
             val playInteractionSource = remember { MutableInteractionSource() }
             val isPlayPressed by playInteractionSource.collectIsPressedAsState()
-            val playPressScale by animateFloatAsState(
-                targetValue = if (isPlayPressed) 0.90f else 1f,
-                animationSpec = spring(
-                    dampingRatio = Spring.DampingRatioMediumBouncy,
-                    stiffness = Spring.StiffnessMedium
-                ),
-                label = "playBtnPressScale"
+            val playPressScaleX by animateFloatAsState(
+                targetValue = if (isPlayPressed && !reduceMotion) 1.045f else 1f,
+                animationSpec = MotionTokens.snappySpring(reduceMotion),
+                label = "playBtnSquashX"
             )
-            val haloPulseScale = if (isPlaying) {
+            val playPressScaleY by animateFloatAsState(
+                targetValue = if (isPlayPressed && !reduceMotion) 0.90f else 1f,
+                animationSpec = MotionTokens.snappySpring(reduceMotion),
+                label = "playBtnSquashY"
+            )
+            val haloPulseScale = if (isPlaying && !reduceMotion) {
                 val infiniteHalo = rememberInfiniteTransition(label = "playHaloPulse")
                 val pulse by infiniteHalo.animateFloat(
                     initialValue = 0.96f,
@@ -3805,6 +4087,7 @@ private fun PlayerTransportSection(
 
             // Centerpiece Glowing Play/Pause Button with Soft Breathing Radial Halo
             val haloColor = ElectricMint
+            val playShape = RoundedCornerShape(playBtnCorner)
             Box(
                 modifier = Modifier
                     .size(84.dp)
@@ -3826,11 +4109,11 @@ private fun PlayerTransportSection(
                     modifier = Modifier
                         .size(playBtnSize)
                         .graphicsLayer {
-                            scaleX = playPressScale
-                            scaleY = playPressScale
+                            scaleX = playPressScaleX
+                            scaleY = playPressScaleY
                         }
-                        .shadow(16.dp, CircleShape, spotColor = ElectricMint)
-                        .clip(CircleShape)
+                        .shadow(16.dp, playShape, spotColor = ElectricMint)
+                        .clip(playShape)
                         .background(ElectricMint)
                         .clickable(
                             interactionSource = playInteractionSource,
@@ -3857,6 +4140,7 @@ private fun PlayerTransportSection(
                 containerColor = frostedFill,
                 borderColor = frostedBorder,
                 inactiveTint = AlabasterWhite,
+                anticipationDirection = 1f,
                 modifier = Modifier.testTag("player_next_button")
             )
 

@@ -21,7 +21,7 @@ import com.example.data.model.AlbumDetailData
 import com.example.data.model.AlbumReleaseItem
 import com.example.data.model.AppThemeState
 import com.example.data.model.ArtistProfileData
-import com.example.data.model.AudioOutputRoute
+import com.example.data.model.AudioQualitySettings
 import com.example.data.model.BatchDownloadProgress
 import com.example.data.model.BottomNavTab
 import com.example.data.model.EqualizerState
@@ -39,6 +39,7 @@ import com.example.data.model.SearchArtistItem
 import com.example.data.model.SearchFilterType
 import com.example.data.model.SleepTimerState
 import com.example.data.model.SongItem
+import com.example.data.model.StreamingQualityMode
 import com.example.data.model.StudioThemePreset
 import com.example.data.model.TimeOfDayShelfData
 import com.example.data.model.defaultEqBands
@@ -141,6 +142,11 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
 
     private val _equalizerState = MutableStateFlow(EqualizerState())
     val equalizerState: StateFlow<EqualizerState> = _equalizerState.asStateFlow()
+
+    private val _audioQualitySettings = MutableStateFlow(
+        PlaybackSessionStore.loadAudioQualitySettings(application)
+    )
+    val audioQualitySettings: StateFlow<AudioQualitySettings> = _audioQualitySettings.asStateFlow()
 
     // Real Live Discovery, Playlists, Search & Library State
     private val _homeDiscoveryData = MutableStateFlow(HomeDiscoveryData())
@@ -373,12 +379,42 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
 
     private fun restoreAudioConsoleSettings() {
         val app = getApplication<Application>()
-        val detectedRoute = PlaybackService.detectCurrentAudioOutputRoute(app)
+        MusicRepository.registerAppContext(app)
+        val savedQuality = PlaybackSessionStore.loadAudioQualitySettings(app)
+        _audioQualitySettings.value = savedQuality
+        MusicRepository.updateAudioQualitySettings(savedQuality, clearResolvedCache = false)
         val savedAudio = PlaybackSessionStore.loadAudioSettings(app)
         _equalizerState.value = savedAudio.copy(
-            activeOutputRoute = detectedRoute,
             autoQueueRadio = true
         )
+    }
+
+    fun setStreamingQualityMode(mode: StreamingQualityMode) {
+        val updated = when (mode) {
+            StreamingQualityMode.DATA_SAVER -> AudioQualitySettings(
+                wifiQuality = StreamingQualityMode.DATA_SAVER,
+                cellularQuality = StreamingQualityMode.DATA_SAVER,
+                dataSaverEnabled = true
+            )
+            StreamingQualityMode.HIGH -> AudioQualitySettings(
+                wifiQuality = StreamingQualityMode.HIGH,
+                cellularQuality = StreamingQualityMode.HIGH,
+                dataSaverEnabled = false
+            )
+            else -> AudioQualitySettings(
+                wifiQuality = StreamingQualityMode.AUTO,
+                cellularQuality = StreamingQualityMode.AUTO,
+                dataSaverEnabled = false
+            )
+        }
+        _audioQualitySettings.value = updated
+        PlaybackSessionStore.saveAudioQualitySettings(getApplication(), updated)
+        MusicRepository.updateAudioQualitySettings(updated, clearResolvedCache = true)
+        _statusBannerMessage.value = when (mode) {
+            StreamingQualityMode.DATA_SAVER -> "Audio quality: Data Saver (96 kbps)"
+            StreamingQualityMode.HIGH -> "Audio quality: High Quality (320 kbps)"
+            else -> "Audio quality: Auto"
+        }
     }
 
     private fun persistAudioConsoleSettings() {
@@ -500,15 +536,6 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                     is PlaybackService.ServicePlaybackEvent.ShuffleToggled -> {
                         toggleShuffle(forceValue = event.isShuffled)
                         showStatusMessage(if (event.isShuffled) "Shuffle On" else "Shuffle Off")
-                    }
-                    is PlaybackService.ServicePlaybackEvent.AudioRouteChanged -> {
-                        val route = event.route
-                        _equalizerState.value = _equalizerState.value.copy(activeOutputRoute = route)
-                        if (_equalizerState.value.autoDeviceProfilesEnabled && !_isKaraokeModeEnabled.value) {
-                            val targetPreset = presetForAudioRoute(_equalizerState.value, route)
-                            applyEqualizerPreset(targetPreset)
-                            showStatusMessage("${route.label} → $targetPreset")
-                        }
                     }
                     PlaybackService.ServicePlaybackEvent.SleepTimerEndedTrack -> {
                         _isPlaying.value = false
@@ -1257,12 +1284,59 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         val topArtistArtwork = artistArt[topArtistName].orEmpty()
             .ifBlank { topSong?.artworkUrl.orEmpty() }
 
+        val topSongsList = playCountsBySongId.entries
+            .sortedByDescending { it.value }
+            .mapNotNull { songMap[it.key] }
+            .ifEmpty { (recent + favs).distinctBy { it.id } }
+            .take(5)
+
+        val topArtistsList = artistScores.entries
+            .sortedByDescending { it.value }
+            .take(5)
+            .map { (name, score) ->
+                RelatedArtistItem(
+                    name = name,
+                    artworkUrl = artistArt[name].orEmpty(),
+                    subtitle = if (score == 1) "1 play" else "$score plays"
+                )
+            }
+
+        val genreScores = LinkedHashMap<String, Int>()
+        for ((songId, count) in playCountsBySongId) {
+            val cat = songMap[songId]?.moodCategory?.trim().orEmpty()
+            if (cat.isNotBlank() && !cat.equals("Trending", ignoreCase = true) && !cat.equals("Music", ignoreCase = true)) {
+                genreScores[cat] = (genreScores[cat] ?: 0) + count
+            }
+        }
+        val topGenre = genreScores.maxByOrNull { it.value }?.key
+            ?: _selectedTasteGenres.value.firstOrNull()?.takeIf { it.isNotBlank() }
+            ?: "Eclectic Studio"
+
+        val uniqueTracksCount = playCountsBySongId.size.coerceAtLeast(recent.distinctBy { it.id }.size)
+        val uniqueArtistsCount = artistScores.size.coerceAtLeast(if (topArtistName.isNotBlank()) 1 else 0)
+        val topSongPlayCount = topSongEntry?.value ?: if (topSong != null) 1 else 0
+        val listenerPersona = when {
+            topSongPlayCount >= 5 && uniqueTracksCount <= 12 -> "Repeat Loyalist"
+            uniqueArtistsCount >= 8 -> "Genre Explorer"
+            totalMinutes >= 60 -> "Studio Audiophile"
+            topGenre.contains("Chill", ignoreCase = true) || topGenre.contains("Lo-Fi", ignoreCase = true) -> "Midnight Cruiser"
+            topGenre.contains("Hip", ignoreCase = true) || topGenre.contains("Punjabi", ignoreCase = true) -> "Bassline Pioneer"
+            else -> "Sound Curator"
+        }
+
         _listeningStats.value = ListeningStatsData(
             totalPlays = totalPlays,
             totalMinutes = totalMinutes,
-            topArtistName = topArtistName,
+            topArtistName = topArtistName.ifBlank { "Explore Music" },
             topArtistArtwork = topArtistArtwork,
-            topSong = topSong
+            topSong = topSong,
+            topSongPlayCount = topSongPlayCount,
+            topSongs = topSongsList,
+            topArtists = topArtistsList,
+            topGenre = topGenre,
+            uniqueTracksCount = uniqueTracksCount,
+            uniqueArtistsCount = uniqueArtistsCount,
+            listenerPersona = listenerPersona
         )
 
         // Build Smart Auto-Playlists:
@@ -1788,19 +1862,8 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             }
 
             override fun onPlayerError(error: PlaybackException) {
-                val activeSong = _currentTrack.value ?: return
-                viewModelScope.launch {
-                    val alternateUrl = repository.getAlternateStreamUrl(activeSong, activeSong.streamUrl)
-                    if (!alternateUrl.isNullOrBlank()) {
-                        val recoveredSong = activeSong.copy(streamUrl = alternateUrl)
-                        _currentTrack.value = recoveredSong
-                        controller.stop()
-                        controller.clearMediaItems()
-                        controller.setMediaItem(buildMediaItem(recoveredSong))
-                        controller.prepare()
-                        controller.play()
-                    }
-                }
+                // PlaybackService.onPlayerError is the single authoritative stream-recovery owner
+                // for both foreground and background playback, preventing dual-recovery collisions.
             }
 
             override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
@@ -1826,9 +1889,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                                 val upgradedSong = activeSong.copy(streamUrl = fullUrl)
                                 _currentTrack.value = upgradedSong
                                 PlaybackService.syncQueueFromUi(_queue.value, upgradedSong)
-                                controller.stop()
-                                controller.clearMediaItems()
-                                controller.setMediaItem(buildMediaItem(upgradedSong))
+                                controller.setMediaItem(buildMediaItem(upgradedSong), 0L)
                                 controller.prepare()
                                 controller.play()
                             } else {
@@ -1850,10 +1911,12 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             }
 
             override fun onRepeatModeChanged(repeatMode: Int) {
-                _repeatMode.value = when (repeatMode) {
-                    Player.REPEAT_MODE_ALL -> PlayerRepeatMode.ALL
-                    Player.REPEAT_MODE_ONE -> PlayerRepeatMode.ONE
-                    else -> PlayerRepeatMode.OFF
+                if (repeatMode == Player.REPEAT_MODE_ONE) {
+                    _repeatMode.value = PlayerRepeatMode.ONE
+                } else if (repeatMode == Player.REPEAT_MODE_ALL) {
+                    _repeatMode.value = PlayerRepeatMode.ALL
+                } else if (_repeatMode.value == PlayerRepeatMode.ONE) {
+                    _repeatMode.value = PlayerRepeatMode.OFF
                 }
             }
         })
@@ -1880,21 +1943,17 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             Bundle().apply { putBoolean(PlaybackService.ARG_EQ_ENABLED, eq.isEnabled) }
         )
         sendServiceCustomCommand(
-            PlaybackService.CMD_SET_CROSSFADE_SECONDS,
-            Bundle().apply { putInt(PlaybackService.ARG_CROSSFADE_SECONDS, eq.crossfadeSeconds) }
-        )
-        sendServiceCustomCommand(
-            PlaybackService.CMD_SET_GAPLESS_PLAYBACK,
-            Bundle().apply { putBoolean(PlaybackService.ARG_GAPLESS_ENABLED, eq.gaplessPlayback) }
-        )
-        sendServiceCustomCommand(
             PlaybackService.CMD_REFRESH_SHUFFLE_ICON,
             Bundle().apply { putBoolean(PlaybackService.ARG_IS_SHUFFLED, _isShuffled.value) }
         )
-        controller.repeatMode = when (_repeatMode.value) {
-            PlayerRepeatMode.OFF -> Player.REPEAT_MODE_OFF
-            PlayerRepeatMode.ALL -> Player.REPEAT_MODE_ALL
-            PlayerRepeatMode.ONE -> Player.REPEAT_MODE_ONE
+        sendServiceCustomCommand(
+            PlaybackService.CMD_SET_REPEAT_MODE,
+            Bundle().apply { putString(PlaybackService.ARG_REPEAT_MODE, _repeatMode.value.name) }
+        )
+        controller.repeatMode = if (_repeatMode.value == PlayerRepeatMode.ONE) {
+            Player.REPEAT_MODE_ONE
+        } else {
+            Player.REPEAT_MODE_OFF
         }
 
         // Keep ExoPlayer internal shuffle OFF because Echoic reorders _queue & serviceQueue directly
@@ -2275,7 +2334,8 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         }
 
         _queue.value = updatedQueue
-        PlaybackService.syncQueueFromUi(updatedQueue, _currentTrack.value)
+        // Pass activeSong = null so replenishing radio tracks never overwrites an auto-advanced service track
+        PlaybackService.syncQueueFromUi(updatedQueue, activeSong = null)
         syncAutoQueueMetadataToService()
     }
 
@@ -2344,16 +2404,19 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             }
         }
 
-        // Immediately silence old track and cancel any in-flight background skip resolution
+        val fastResolvedUrl = song.streamUrl.takeIf { repository.isFullLengthStreamUrl(it) }
+            ?: repository.getCachedValidStreamUrl(song.id)
+
+        // Cancel any in-flight background skip without clearing MediaItems (keeps notification rock-solid)
         mediaController?.let { controller ->
             if (controller.isConnected) {
                 controller.sendCustomCommand(
                     SessionCommand(PlaybackService.CMD_CANCEL_PENDING_LOAD, Bundle.EMPTY),
-                    Bundle().apply { putBoolean(PlaybackService.ARG_STOP_PLAYER, true) }
+                    Bundle().apply { putBoolean(PlaybackService.ARG_STOP_PLAYER, fastResolvedUrl.isNullOrBlank()) }
                 )
-                controller.pause()
-                controller.stop()
-                controller.clearMediaItems()
+                if (fastResolvedUrl.isNullOrBlank() && controller.isPlaying) {
+                    controller.pause()
+                }
             }
         }
 
@@ -2395,28 +2458,58 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         sessionAutoQueuedSignatures.add(repository.songDeduplicationSignature(song))
         effectiveQueue.forEach { sessionAutoQueuedSignatures.add(repository.songDeduplicationSignature(it)) }
 
-        _queue.value = effectiveQueue
-        _currentTrack.value = song
+        val initialSong = if (!fastResolvedUrl.isNullOrBlank()) {
+            song.copy(
+                streamUrl = fastResolvedUrl,
+                isDownloaded = fastResolvedUrl.startsWith("file://") || song.isDownloaded
+            )
+        } else {
+            song
+        }
+        val initialQueue = if (!fastResolvedUrl.isNullOrBlank()) {
+            effectiveQueue.map { if (it.id == initialSong.id) initialSong else it }
+        } else {
+            effectiveQueue
+        }
+
+        _queue.value = initialQueue
+        _currentTrack.value = initialSong
         _progressMs.value = startPositionMs.coerceAtLeast(0L)
-        _durationMs.value = song.durationMs.coerceAtLeast(30_000L)
+        _durationMs.value = initialSong.durationMs.coerceAtLeast(30_000L)
         _isPlaying.value = true
-        _isResolvingStream.value = true
-        PlaybackService.syncQueueFromUi(effectiveQueue, song)
+        _isResolvingStream.value = fastResolvedUrl.isNullOrBlank()
+        PlaybackService.syncQueueFromUi(initialQueue, initialSong)
         sendServiceCustomCommand(
             PlaybackService.CMD_REFRESH_SHUFFLE_ICON,
             Bundle().apply { putBoolean(PlaybackService.ARG_IS_SHUFFLED, _isShuffled.value) }
         )
+        sendServiceCustomCommand(
+            PlaybackService.CMD_REFRESH_FAVORITE_ICON,
+            Bundle().apply { putBoolean(PlaybackService.ARG_IS_FAVORITE, initialSong.isFavorite) }
+        )
         syncAutoQueueMetadataToService()
         persistPlaybackSession()
 
-        fetchLyricsForTrack(song)
-        recordSongPlayForStats(song)
+        fetchLyricsForTrack(initialSong)
+        recordSongPlayForStats(initialSong)
         viewModelScope.launch {
-            repository.recordRecentlyPlayed(song)
+            repository.recordRecentlyPlayed(initialSong)
         }
 
         // Proactively hydrate endless queue if < 5 tracks remain ahead (or customQueue is empty)
         maybeReplenishEndlessQueue()
+
+        // INSTANT 0ms FAST-PATH: If stream URL is already known/cached, start ExoPlayer immediately on main thread
+        if (!fastResolvedUrl.isNullOrBlank()) {
+            consecutiveStreamFailures = 0
+            val controller = mediaController
+            if (controller != null && controller.isConnected) {
+                controller.setMediaItem(buildMediaItem(initialSong), startPositionMs.coerceAtLeast(0L))
+                controller.prepare()
+                controller.play()
+            }
+            return
+        }
 
         playSongJob = viewModelScope.launch {
             val localOfflineUri = repository.getOfflineLocalFileUri(song.id)
@@ -2440,7 +2533,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             if (resolvedStreamUrl.isBlank()) {
                 _isPlaying.value = false
                 consecutiveStreamFailures++
-                if (consecutiveStreamFailures < 3 && _queue.value.size > 1) {
+                if (consecutiveStreamFailures < 5 && _queue.value.size > 1) {
                     showStatusMessage("Unavailable: \"${song.title}\" — skipping next")
                     skipNext(isAutoRecovery = true)
                 } else {
@@ -2467,12 +2560,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
 
             val controller = mediaController
             if (controller != null && controller.isConnected && requestSeq == playRequestSeq.get()) {
-                controller.stop()
-                controller.clearMediaItems()
-                controller.setMediaItem(buildMediaItem(updatedSong))
-                if (startPositionMs > 0L) {
-                    controller.seekTo(startPositionMs)
-                }
+                controller.setMediaItem(buildMediaItem(updatedSong), startPositionMs.coerceAtLeast(0L))
                 controller.prepare()
                 controller.play()
             }
@@ -2692,9 +2780,9 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                             SessionCommand(PlaybackService.CMD_CANCEL_PENDING_LOAD, Bundle.EMPTY),
                             Bundle().apply { putBoolean(PlaybackService.ARG_STOP_PLAYER, true) }
                         )
-                        controller.pause()
-                        controller.stop()
-                        controller.clearMediaItems()
+                        if (controller.isPlaying) {
+                            controller.pause()
+                        }
                     }
                 }
                 _progressMs.value = 0L
@@ -2833,10 +2921,14 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             PlayerRepeatMode.ONE -> PlayerRepeatMode.OFF
         }
         _repeatMode.value = nextMode
-        mediaController?.repeatMode = when (nextMode) {
-            PlayerRepeatMode.OFF -> Player.REPEAT_MODE_OFF
-            PlayerRepeatMode.ALL -> Player.REPEAT_MODE_ALL
-            PlayerRepeatMode.ONE -> Player.REPEAT_MODE_ONE
+        sendServiceCustomCommand(
+            PlaybackService.CMD_SET_REPEAT_MODE,
+            Bundle().apply { putString(PlaybackService.ARG_REPEAT_MODE, nextMode.name) }
+        )
+        mediaController?.repeatMode = if (nextMode == PlayerRepeatMode.ONE) {
+            Player.REPEAT_MODE_ONE
+        } else {
+            Player.REPEAT_MODE_OFF
         }
         persistPlaybackSession()
     }
@@ -3075,76 +3167,6 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             Bundle().apply { putInt(PlaybackService.ARG_BASS_STRENGTH, bassStrength) }
         )
         persistAudioConsoleSettings()
-    }
-
-    fun setCrossfadeSeconds(seconds: Int) {
-        val clamped = seconds.coerceIn(0, 12)
-        _equalizerState.value = _equalizerState.value.copy(crossfadeSeconds = clamped)
-        sendServiceCustomCommand(
-            PlaybackService.CMD_SET_CROSSFADE_SECONDS,
-            Bundle().apply { putInt(PlaybackService.ARG_CROSSFADE_SECONDS, clamped) }
-        )
-        persistAudioConsoleSettings()
-    }
-
-    fun setGaplessPlayback(enabled: Boolean) {
-        _equalizerState.value = _equalizerState.value.copy(gaplessPlayback = enabled)
-        sendServiceCustomCommand(
-            PlaybackService.CMD_SET_GAPLESS_PLAYBACK,
-            Bundle().apply { putBoolean(PlaybackService.ARG_GAPLESS_ENABLED, enabled) }
-        )
-        persistAudioConsoleSettings()
-    }
-
-    private fun presetForAudioRoute(state: EqualizerState, route: AudioOutputRoute): String = when (route) {
-        AudioOutputRoute.SPEAKER -> state.speakerPreset
-        AudioOutputRoute.WIRED_HEADPHONES -> state.wiredPreset
-        AudioOutputRoute.BLUETOOTH -> state.bluetoothPreset
-    }
-
-    fun setAutoDeviceProfilesEnabled(enabled: Boolean) {
-        val currentRoute = PlaybackService.detectCurrentAudioOutputRoute(getApplication())
-        _equalizerState.value = _equalizerState.value.copy(
-            autoDeviceProfilesEnabled = enabled,
-            activeOutputRoute = currentRoute
-        )
-        if (enabled && !_isKaraokeModeEnabled.value) {
-            val mappedPreset = presetForAudioRoute(_equalizerState.value, currentRoute)
-            applyEqualizerPreset(mappedPreset)
-            showStatusMessage("Auto-Profiles On (${currentRoute.label} → $mappedPreset)")
-        } else {
-            persistAudioConsoleSettings()
-        }
-    }
-
-    fun setOutputRoutePreset(route: AudioOutputRoute, presetName: String) {
-        val current = _equalizerState.value
-        val updated = when (route) {
-            AudioOutputRoute.SPEAKER -> current.copy(speakerPreset = presetName)
-            AudioOutputRoute.WIRED_HEADPHONES -> current.copy(wiredPreset = presetName)
-            AudioOutputRoute.BLUETOOTH -> current.copy(bluetoothPreset = presetName)
-        }
-        _equalizerState.value = updated
-        if (updated.autoDeviceProfilesEnabled &&
-            updated.activeOutputRoute == route &&
-            !_isKaraokeModeEnabled.value
-        ) {
-            applyEqualizerPreset(presetName)
-        } else {
-            persistAudioConsoleSettings()
-        }
-    }
-
-    fun setAutoQueueRadio(enabled: Boolean) {
-        // Endless Autoplay stays always enabled
-        _equalizerState.value = _equalizerState.value.copy(autoQueueRadio = true)
-        personalizationPrefs.edit().putBoolean("auto_queue_radio_enabled", true).apply()
-        syncAutoQueueMetadataToService()
-        sendServiceCustomCommand(
-            PlaybackService.CMD_SET_AUTO_QUEUE_RADIO,
-            Bundle().apply { putBoolean(PlaybackService.ARG_AUTO_QUEUE_ENABLED, true) }
-        )
-        maybeReplenishEndlessQueue()
     }
 
     fun toggleFavorite(song: SongItem) {

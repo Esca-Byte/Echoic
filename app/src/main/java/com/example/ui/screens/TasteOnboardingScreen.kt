@@ -81,8 +81,10 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
@@ -102,6 +104,8 @@ import com.example.ui.theme.CyberCyan
 import com.example.ui.theme.DimSlate
 import com.example.ui.theme.ElectricMint
 import com.example.ui.theme.JetBrainsMonoFontFamily
+import com.example.ui.theme.LocalMotionConfig
+import com.example.ui.theme.MotionTokens
 import com.example.ui.theme.MutedSlate
 import com.example.ui.theme.NeonViolet
 import com.example.ui.theme.PitchBlack
@@ -167,6 +171,8 @@ fun TasteOnboardingScreen(
     }
 
     val focusManager = LocalFocusManager.current
+    val haptic = LocalHapticFeedback.current
+    val reduceMotion = LocalMotionConfig.current.reduceMotion
 
     BackHandler(enabled = currentStep == 2) {
         focusManager.clearFocus()
@@ -190,10 +196,7 @@ fun TasteOnboardingScreen(
             ((currentStep - 1) * 0.5f) +
                 (selectedCount.coerceAtMost(requiredCount).toFloat() / requiredCount.toFloat()) * 0.5f
             ).coerceIn(0.08f, 1f),
-        animationSpec = spring(
-            dampingRatio = Spring.DampingRatioMediumBouncy,
-            stiffness = Spring.StiffnessMediumLow
-        ),
+        animationSpec = MotionTokens.fluidSpring(reduceMotion),
         label = "onboardingStepProgress"
     )
 
@@ -414,22 +417,18 @@ fun TasteOnboardingScreen(
                 AnimatedContent(
                     targetState = currentStep,
                     transitionSpec = {
-                        if (targetState > initialState) {
-                            (fadeIn(tween(240)) + slideInHorizontally(
-                                animationSpec = spring(
-                                    dampingRatio = Spring.DampingRatioNoBouncy,
-                                    stiffness = Spring.StiffnessMediumLow
-                                ),
+                        if (reduceMotion) {
+                            fadeIn(tween(110)).togetherWith(fadeOut(tween(90)))
+                        } else if (targetState > initialState) {
+                            (fadeIn(tween(MotionTokens.StandardMs, easing = MotionTokens.EmphasizedDecelerate)) + slideInHorizontally(
+                                animationSpec = MotionTokens.gentleSpring(false),
                                 initialOffsetX = { it / 4 }
-                            )).togetherWith(fadeOut(tween(180)) + slideOutHorizontally { -it / 5 })
+                            )).togetherWith(fadeOut(tween(160)) + slideOutHorizontally { -it / 5 })
                         } else {
-                            (fadeIn(tween(240)) + slideInHorizontally(
-                                animationSpec = spring(
-                                    dampingRatio = Spring.DampingRatioNoBouncy,
-                                    stiffness = Spring.StiffnessMediumLow
-                                ),
+                            (fadeIn(tween(MotionTokens.StandardMs, easing = MotionTokens.EmphasizedDecelerate)) + slideInHorizontally(
+                                animationSpec = MotionTokens.gentleSpring(false),
                                 initialOffsetX = { -it / 4 }
-                            )).togetherWith(fadeOut(tween(180)) + slideOutHorizontally { it / 5 })
+                            )).togetherWith(fadeOut(tween(160)) + slideOutHorizontally { it / 5 })
                         }
                     },
                     label = "tasteOnboardingStepTransition"
@@ -529,19 +528,17 @@ fun TasteOnboardingScreen(
                     val isCtaPressed by ctaInteractionSource.collectIsPressedAsState()
                     val ctaScale by animateFloatAsState(
                         targetValue = when {
-                            isCtaPressed && isStepReady -> 0.96f
+                            isCtaPressed && isStepReady && !reduceMotion -> 0.96f
                             else -> 1f
                         },
-                        animationSpec = spring(
-                            dampingRatio = Spring.DampingRatioMediumBouncy,
-                            stiffness = Spring.StiffnessMedium
-                        ),
+                        animationSpec = MotionTokens.snappySpring(reduceMotion),
                         label = "onboardingCtaScale"
                     )
 
                     Button(
                         onClick = {
                             focusManager.clearFocus()
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                             if (currentStep == 1) {
                                 currentStep = 2
                             } else {
@@ -631,35 +628,34 @@ private fun GenreSelectionStepContent(
             items = genres,
             key = { it.id }
         ) { genre ->
+            val reduceMotion = LocalMotionConfig.current.reduceMotion
             val selected = isGenreSelected(genre)
             val interactionSource = remember { MutableInteractionSource() }
             val isPressed by interactionSource.collectIsPressedAsState()
 
             val tileScale by animateFloatAsState(
                 targetValue = when {
+                    reduceMotion -> 1f
                     isPressed -> 0.94f
                     selected -> 1.02f
                     else -> 1f
                 },
-                animationSpec = spring(
-                    dampingRatio = Spring.DampingRatioMediumBouncy,
-                    stiffness = Spring.StiffnessMedium
-                ),
+                animationSpec = MotionTokens.snappySpring(reduceMotion),
                 label = "genreTileScale"
             )
             val containerColor by animateColorAsState(
                 targetValue = if (selected) ElectricMint.copy(alpha = 0.16f) else CarbonSurface,
-                animationSpec = tween(180),
+                animationSpec = MotionTokens.microTween(reduceMotion),
                 label = "genreTileBg"
             )
             val borderColor by animateColorAsState(
                 targetValue = if (selected) ElectricMint else SubtleBorder,
-                animationSpec = tween(180),
+                animationSpec = MotionTokens.microTween(reduceMotion),
                 label = "genreTileBorder"
             )
             val borderWidth by animateDpAsState(
                 targetValue = if (selected) 1.5.dp else 0.8.dp,
-                animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy),
+                animationSpec = MotionTokens.snappySpring(reduceMotion),
                 label = "genreTileBorderWidth"
             )
 
@@ -901,29 +897,28 @@ private fun OnboardingArtistCard(
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val reduceMotion = LocalMotionConfig.current.reduceMotion
     val interactionSource = remember { MutableInteractionSource() }
     val isPressed by interactionSource.collectIsPressedAsState()
 
     val cardScale by animateFloatAsState(
         targetValue = when {
+            reduceMotion -> 1f
             isPressed -> 0.92f
             isSelected -> 1.04f
             else -> 1f
         },
-        animationSpec = spring(
-            dampingRatio = Spring.DampingRatioMediumBouncy,
-            stiffness = Spring.StiffnessMedium
-        ),
+        animationSpec = MotionTokens.snappySpring(reduceMotion),
         label = "artistCardScale"
     )
     val ringColor by animateColorAsState(
         targetValue = if (isSelected) ElectricMint else SubtleBorder,
-        animationSpec = tween(180),
+        animationSpec = MotionTokens.microTween(reduceMotion),
         label = "artistRingColor"
     )
     val ringWidth by animateDpAsState(
         targetValue = if (isSelected) 2.5.dp else 0.9.dp,
-        animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy),
+        animationSpec = MotionTokens.snappySpring(reduceMotion),
         label = "artistRingWidth"
     )
 

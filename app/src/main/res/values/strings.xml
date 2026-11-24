@@ -22,4 +22,10 @@
     <string name="widget_artwork_cd">Album Artwork</string>
     <string name="widget_empty_title">Echoic Music</string>
     <string name="widget_empty_artist">Tap to start listening</string>
+    <string name="voice_search_cd">Voice search</string>
+    <string name="voice_search_prompt">Say a song, artist, or mood…</string>
+    <string name="voice_search_unavailable">Voice search is unavailable on this device</string>
+    <string name="audio_quality_title">Audio Quality &amp; Data Saver</string>
+    <string name="data_saver_title">Data Saver Mode</string>
+    <string name="share_replay_cta">Echoic Replay</string>
 </resources>

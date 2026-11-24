@@ -2,6 +2,7 @@ package com.example.data.local
 
 import android.content.Context
 import com.example.data.model.AppThemeState
+import com.example.data.model.AudioQualitySettings
 import com.example.data.model.EqualizerState
 import com.example.data.model.PlayerRepeatMode
 import com.example.data.model.SongItem
@@ -27,13 +28,7 @@ data class PersistedAudioSettings(
     val isEqEnabled: Boolean = false,
     val bandLevelsMb: List<Int> = listOf(300, 150, 0, 200, 350),
     val bassBoostStrength: Int = 250,
-    val activePreset: String = "Studio Warmth",
-    val crossfadeSeconds: Int = 4,
-    val gaplessPlayback: Boolean = true,
-    val autoDeviceProfilesEnabled: Boolean = true,
-    val speakerPreset: String = "Treble Sparkle",
-    val wiredPreset: String = "Studio Warmth",
-    val bluetoothPreset: String = "Bass Boost"
+    val activePreset: String = "Studio Warmth"
 )
 
 object PlaybackSessionStore {
@@ -46,6 +41,9 @@ object PlaybackSessionStore {
 
     private const val THEME_PREFS = "echoic_theme_prefs"
     private const val KEY_THEME_STATE_JSON = "persisted_theme_state_json"
+
+    private const val QUALITY_PREFS = "echoic_audio_quality_prefs"
+    private const val KEY_QUALITY_SETTINGS_JSON = "persisted_audio_quality_json"
 
     private val json = Json {
         ignoreUnknownKeys = true
@@ -108,13 +106,7 @@ object PlaybackSessionStore {
             isEqEnabled = eqState.isEnabled,
             bandLevelsMb = eqState.bands.map { it.currentLevelMb.toInt() },
             bassBoostStrength = eqState.bassBoostStrength,
-            activePreset = eqState.activePreset,
-            crossfadeSeconds = eqState.crossfadeSeconds,
-            gaplessPlayback = eqState.gaplessPlayback,
-            autoDeviceProfilesEnabled = eqState.autoDeviceProfilesEnabled,
-            speakerPreset = eqState.speakerPreset,
-            wiredPreset = eqState.wiredPreset,
-            bluetoothPreset = eqState.bluetoothPreset
+            activePreset = eqState.activePreset
         )
         runCatching {
             val encoded = json.encodeToString(payload)
@@ -146,13 +138,7 @@ object PlaybackSessionStore {
             bands = bands,
             bassBoostStrength = parsed.bassBoostStrength.coerceIn(0, 1000),
             activePreset = parsed.activePreset.ifBlank { "Studio Warmth" },
-            crossfadeSeconds = parsed.crossfadeSeconds.coerceIn(0, 12),
-            gaplessPlayback = parsed.gaplessPlayback,
-            autoQueueRadio = true,
-            autoDeviceProfilesEnabled = parsed.autoDeviceProfilesEnabled,
-            speakerPreset = parsed.speakerPreset.ifBlank { "Treble Sparkle" },
-            wiredPreset = parsed.wiredPreset.ifBlank { "Studio Warmth" },
-            bluetoothPreset = parsed.bluetoothPreset.ifBlank { "Bass Boost" }
+            autoQueueRadio = true
         )
     }
 
@@ -175,5 +161,26 @@ object PlaybackSessionStore {
         return runCatching {
             json.decodeFromString<AppThemeState>(raw)
         }.getOrDefault(AppThemeState())
+    }
+
+    fun saveAudioQualitySettings(context: Context, settings: AudioQualitySettings) {
+        runCatching {
+            val encoded = json.encodeToString(settings)
+            context.applicationContext
+                .getSharedPreferences(QUALITY_PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .putString(KEY_QUALITY_SETTINGS_JSON, encoded)
+                .apply()
+        }
+    }
+
+    fun loadAudioQualitySettings(context: Context): AudioQualitySettings {
+        val raw = context.applicationContext
+            .getSharedPreferences(QUALITY_PREFS, Context.MODE_PRIVATE)
+            .getString(KEY_QUALITY_SETTINGS_JSON, null)
+            ?: return AudioQualitySettings()
+        return runCatching {
+            json.decodeFromString<AudioQualitySettings>(raw)
+        }.getOrDefault(AudioQualitySettings())
     }
 }

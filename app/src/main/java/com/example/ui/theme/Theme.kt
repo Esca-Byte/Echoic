@@ -26,7 +26,8 @@ fun SomifyTheme(
         dynamicArtworkTint = themeState.dynamicArtworkTint
     )
 
-    val spec = tween<Color>(durationMillis = 280)
+    val motionConfig = rememberMotionConfig()
+    val spec = MotionTokens.standardTween<Color>(motionConfig.reduceMotion)
     val bg by animateColorAsState(targetPalette.background, spec, label = "themeBg")
     val surface by animateColorAsState(targetPalette.surface, spec, label = "themeSurface")
     val elevated by animateColorAsState(targetPalette.surfaceElevated, spec, label = "themeElevated")
@@ -119,7 +120,10 @@ fun SomifyTheme(
         }
     }
 
-    CompositionLocalProvider(LocalStudioPalette provides animatedPalette) {
+    CompositionLocalProvider(
+        LocalStudioPalette provides animatedPalette,
+        LocalMotionConfig provides motionConfig
+    ) {
         MaterialTheme(
             colorScheme = colorScheme,
             typography = Typography,

@@ -151,26 +151,13 @@ data class EqualizerBand(
     val currentLevelMb: Short
 )
 
-enum class AudioOutputRoute(val key: String, val label: String) {
-    SPEAKER("speaker", "Phone Speaker"),
-    WIRED_HEADPHONES("wired", "Wired Headphones"),
-    BLUETOOTH("bluetooth", "Bluetooth Audio")
-}
-
 @Immutable
 data class EqualizerState(
     val isEnabled: Boolean = false,
     val bands: List<EqualizerBand> = defaultEqBands(),
     val bassBoostStrength: Int = 250, // 0..1000
     val activePreset: String = "Studio Warmth",
-    val crossfadeSeconds: Int = 4, // 0..12s
-    val gaplessPlayback: Boolean = true,
-    val autoQueueRadio: Boolean = true,
-    val autoDeviceProfilesEnabled: Boolean = true,
-    val activeOutputRoute: AudioOutputRoute = AudioOutputRoute.SPEAKER,
-    val speakerPreset: String = "Treble Sparkle",
-    val wiredPreset: String = "Studio Warmth",
-    val bluetoothPreset: String = "Bass Boost"
+    val autoQueueRadio: Boolean = true
 )
 
 fun defaultEqBands(): List<EqualizerBand> = listOf(
@@ -245,7 +232,14 @@ data class ListeningStatsData(
     val totalMinutes: Int = 0,
     val topArtistName: String = "",
     val topArtistArtwork: String = "",
-    val topSong: SongItem? = null
+    val topSong: SongItem? = null,
+    val topSongPlayCount: Int = 0,
+    val topSongs: List<SongItem> = emptyList(),
+    val topArtists: List<RelatedArtistItem> = emptyList(),
+    val topGenre: String = "Eclectic Mix",
+    val uniqueTracksCount: Int = 0,
+    val uniqueArtistsCount: Int = 0,
+    val listenerPersona: String = "Sound Explorer"
 )
 
 enum class TrackSortOrder(val label: String) {
@@ -308,3 +302,32 @@ data class AppThemeState(
     val amoledPureBlack: Boolean = false,
     val dynamicArtworkTint: Boolean = true
 )
+
+@Serializable
+enum class StreamingQualityMode(
+    val label: String,
+    val bitrateBadge: String,
+    val estimatedMbPerHour: Int,
+    val subtitle: String
+) {
+    AUTO("Auto", "Adaptive", 96, "High on Wi-Fi · Balanced on mobile"),
+    HIGH("Studio High", "320 kbps", 144, "Maximum clarity & rich studio detail"),
+    BALANCED("Balanced", "160 kbps", 72, "Crisp audio with faster loading"),
+    DATA_SAVER("Data Saver", "96 kbps", 42, "Fastest stream start & ~70% less data")
+}
+
+@Immutable
+@Serializable
+data class AudioQualitySettings(
+    val wifiQuality: StreamingQualityMode = StreamingQualityMode.HIGH,
+    val cellularQuality: StreamingQualityMode = StreamingQualityMode.AUTO,
+    val dataSaverEnabled: Boolean = false
+)
+
+enum class ReplayCardTheme(val label: String) {
+    OBSIDIAN_MINT("Obsidian Mint"),
+    SUNSET_VINYL("Sunset Vinyl"),
+    CYBER_VIOLET("Cyber Violet"),
+    CHAMPAGNE_GOLD("Champagne Gold"),
+    MIDNIGHT_OLED("Midnight OLED")
+}
